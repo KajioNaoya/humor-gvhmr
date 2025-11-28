@@ -72,6 +72,7 @@ def parse_args(argv):
     parser.add_argument('--contact-vel-weight', type=float,nargs=NSTAGES, default=[0.0, 0.0, 0.0], help='Predicted contacting joints have 0 velocity when in contact')
     parser.add_argument('--contact-height-weight', type=float,nargs=NSTAGES, default=[0.0, 0.0, 0.0], help='Predicted contacting joints are at the height of the floor')
     parser.add_argument('--floor-reg-weight', type=float,nargs=NSTAGES, default=[0.0, 0.0, 0.0], help='L2 Regularization that pushes floor to stay close to the initialization.')
+    parser.add_argument('--smpl-param-obs-weight', type=float,nargs=NSTAGES, default=[0.0, 0.0, 0.0], help='L2 loss between predicted SMPLH parameters and external SMPL estimates.')
     # loss options
     parser.add_argument('--robust-loss', type=str, default='bisquare', choices=['none', 'bisquare'], help='Which robust loss weighting to use for points3d losses (if any).')
     parser.add_argument('--robust-tuning-const', type=float, default=4.6851, help='Tuning constant to use in the robust loss.')

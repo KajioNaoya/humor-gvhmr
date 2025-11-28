@@ -217,7 +217,8 @@ def main(args, config_file):
         'contact_vel' : args.contact_vel_weight,
         'contact_height' : args.contact_height_weight,
         'floor_reg' : args.floor_reg_weight,
-        'rgb_overlap_consist' : args.rgb_overlap_consist_weight
+        'rgb_overlap_consist' : args.rgb_overlap_consist_weight,
+        'smpl_param_obs' : args.smpl_param_obs_weight,
     }
 
     max_loss_weights = {k : max(v) for k, v in loss_weights.items()}

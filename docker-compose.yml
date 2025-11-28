@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  humor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: humor:cpu
+    container_name: humor-cpu
+    volumes:
+      # Mount the current directory to /workspace/humor
+      - .:/workspace/humor
+      # Mount body_models directory (must be populated manually)
+      - ./body_models:/workspace/humor/body_models
+      # Mount checkpoints directory (must be populated manually)
+      - ./checkpoints:/workspace/humor/checkpoints
+      # Mount output directory
+      - ./out:/workspace/humor/out
+      # Mount data directory
+      - ./data:/workspace/humor/data
+    working_dir: /workspace/humor
+    environment:
+      - PYTHONPATH=/workspace/humor
+      - PYOPENGL_PLATFORM=osmesa
+      - MUJOCO_GL=osmesa
+    stdin_open: true
+    tty: true
+    command: /bin/bash

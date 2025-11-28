@@ -1,0 +1,67 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Python cache
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Output directories
+out/
+*.log
+
+# Downloaded data (to be mounted as volumes)
+data/amass_raw/
+data/amass_processed/
+data/prox/
+data/iMapper/
+
+# Body models (to be mounted as volumes)
+body_models/smplh/
+body_models/vposer_v1_0/
+
+# Checkpoints (to be mounted as volumes)
+checkpoints/
+
+# External dependencies
+external/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Docker files
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation
+*.md
+*.png
+LICENSE
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tar.xz
+

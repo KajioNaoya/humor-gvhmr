@@ -297,6 +297,7 @@ class MotionOptimizer():
                 pred_data, _ = self.smpl_results(self.trans, self.root_orient, body_pose, self.betas)
                 pred_data['latent_pose'] = self.latent_pose
                 pred_data['betas'] = self.betas
+                pred_data['pose_body'] = body_pose
                 # compute data losses and pose prior
                 loss, stats_dict = self.fitting_loss.smpl_fit(observed_data, pred_data, self.seq_len)
                 log_cur_stats(stats_dict, loss, iter=i)
@@ -565,6 +566,7 @@ class MotionOptimizer():
 
                 pred_data['latent_pose'] = cur_latent_pose
                 pred_data['betas'] = cur_betas
+                pred_data['pose_body'] = cur_body_pose
 
                 pred_data['latent_motion'] = cur_latent_motion
                 # info for init state pose prior
@@ -582,6 +584,7 @@ class MotionOptimizer():
                     cam_pred_data, _ = self.smpl_results(cur_cam_trans, cur_cam_root_orient, cur_body_pose, cur_betas)
                     cam_pred_data['latent_pose'] = cur_latent_pose
                     cam_pred_data['betas'] = cur_betas
+                    cam_pred_data['pose_body'] = cur_body_pose
                     cam_pred_data['floor_plane'] = self.floor_plane
 
                 loss_nsteps = self.seq_len

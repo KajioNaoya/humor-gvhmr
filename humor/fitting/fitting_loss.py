@@ -221,6 +221,20 @@ class FittingLoss(nn.Module):
                 loss += self.loss_weights['rgb_overlap_consist']*cur_loss
                 stats_dict['rgb_overlap_xbatch_betas'] = cur_loss
 
+        # optional loss to keep SMPL parameters close to external estimates
+        if 'pose_body' in pred_data and \
+           'smpl_pose_obs' in observed_data and \
+           'smpl_betas_obs' in observed_data and \
+           self.loss_weights.get('smpl_param_obs', 0.0) > 0.0:
+            cur_loss = self.smpl_param_obs_loss(
+                pred_data['pose_body'],
+                pred_data['betas'],
+                observed_data['smpl_pose_obs'],
+                observed_data['smpl_betas_obs']
+            )
+            loss += self.loss_weights['smpl_param_obs'] * cur_loss
+            stats_dict['smpl_param_obs'] = cur_loss
+
         return loss, stats_dict
 
     def motion_fit(self, observed_data, pred_data, cam_pred_data, nsteps, cond_prior=None, init_motion_scale=1.0):
@@ -482,6 +496,40 @@ class FittingLoss(nn.Module):
         floor_loss = 0.5*torch.sum(floor_loss)
 
         return floor_loss
+
+    def smpl_param_obs_loss(self, pose_body_pred, betas_pred, pose_body_obs, betas_obs):
+        """
+        L2 loss between predicted SMPLH pose/betas and external SMPL parameters.
+
+        - pose_body_pred : (B, T, J_body*3) angle-axis, SMPLH body joints (no root)
+        - betas_pred     : (B, num_betas)
+        - pose_body_obs  : (B, T, K*3) angle-axis, external SMPL joints with root removed
+        - betas_obs      : (B, 10) or (B, *, 10) external SMPL shape parameters
+        """
+        # pose loss (ignore global rotation; inputs are already body-only)
+        B, T, D_pred = pose_body_pred.size()
+        _, _, D_obs = pose_body_obs.size()
+        J_pred = D_pred // 3
+        J_obs = D_obs // 3
+        J = min(J_pred, J_obs)
+
+        pose_body_pred = pose_body_pred[:, :, :J*3].reshape(B, T, J, 3)
+        pose_body_obs = pose_body_obs[:, :, :J*3].reshape(B, T, J, 3)
+
+        pose_diff = pose_body_pred - pose_body_obs
+        pose_loss = 0.5 * torch.sum(pose_diff ** 2)
+
+        # shape (beta) loss: compare first 10 components
+        beta_pred = betas_pred[:, :10]
+        # allow an extra temporal dimension in betas_obs if provided as (B, T, 10)
+        if betas_obs.dim() == 3:
+            beta_obs = betas_obs[:, 0, :]
+        else:
+            beta_obs = betas_obs
+        beta_diff = beta_pred - beta_obs
+        beta_loss = 0.5 * torch.sum(beta_diff ** 2)
+
+        return pose_loss + beta_loss
 
     def kl_normal(self, qm, qv, pm, pv):
         """
