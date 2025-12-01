@@ -150,53 +150,55 @@ class MotionOptimizer():
             self.floor_plane.requires_grad = True
 
             # optimizing from 2D data, must initialize cam/body trans
-            if 'points3d' in observed_data:
-                # initialize with mean of point cloud
-                point_seq = observed_data['points3d'] # B x T x N x 3
-                self.trans = torch.mean(point_seq, dim=2).clone().detach()
-            elif 'joints2d' in observed_data:
-                # only have RGB data to use
-                # use focal length and bone lengths to approximate
-                # (based on PROX https://github.com/mohamedhassanmus/prox/blob/master/prox/fitting.py)
+            # GVHMRの奥行推定を一度信用し，trans[:,:,2]の書き換えを無効化した
+            
+            # if 'points3d' in observed_data:
+            #     # initialize with mean of point cloud
+            #     point_seq = observed_data['points3d'] # B x T x N x 3
+            #     self.trans = torch.mean(point_seq, dim=2).clone().detach()
+            # elif 'joints2d' in observed_data:
+            #     # only have RGB data to use
+            #     # use focal length and bone lengths to approximate
+            #     # (based on PROX https://github.com/mohamedhassanmus/prox/blob/master/prox/fitting.py)
 
-                # get 3D joints mapped to OpenPose
-                body_pose = self.latent2pose(self.latent_pose)
-                pred_data, _ = self.smpl_results(self.trans, self.root_orient, body_pose, self.betas)
-                joints3d_full = torch.cat([pred_data['joints3d'], pred_data['joints3d_extra']], dim=2)
-                joints3d_op = joints3d_full[:,:,self.smpl2op_map,:]
-                # openpose observations
-                joints2d_obs = observed_data['joints2d'][:,:,:,:2]
-                joints2d_conf = observed_data['joints2d'][:,:,:,2]
+            #     # get 3D joints mapped to OpenPose
+            #     body_pose = self.latent2pose(self.latent_pose)
+            #     pred_data, _ = self.smpl_results(self.trans, self.root_orient, body_pose, self.betas)
+            #     joints3d_full = torch.cat([pred_data['joints3d'], pred_data['joints3d_extra']], dim=2)
+            #     joints3d_op = joints3d_full[:,:,self.smpl2op_map,:]
+            #     # openpose observations
+            #     joints2d_obs = observed_data['joints2d'][:,:,:,:2]
+            #     joints2d_conf = observed_data['joints2d'][:,:,:,2]
 
-                # find least-occluded 2d frame
-                num_2d_vis = torch.sum(joints2d_conf > 0.0, dim=2)
-                best_2d_idx = torch.max(num_2d_vis, dim=1)[1]
+            #     # find least-occluded 2d frame
+            #     num_2d_vis = torch.sum(joints2d_conf > 0.0, dim=2)
+            #     best_2d_idx = torch.max(num_2d_vis, dim=1)[1]
 
-                # calculate bone lengths and confidence in each bone length
-                bone3d = []
-                bone2d = []
-                conf2d = []
-                for pair in OP_EDGE_LIST:
-                    diff3d = torch.norm(joints3d_op[:,0,pair[0],:] - joints3d_op[:,0,pair[1],:], dim=1) # does not change over time
-                    diff2d = torch.norm(joints2d_obs[:,:,pair[0],:] - joints2d_obs[:,:,pair[1],:], dim=2)
-                    minconf2d = torch.min(joints2d_conf[:,:,pair[0]], joints2d_conf[:,:,pair[1]])
-                    bone3d.append(diff3d)
-                    bone2d.append(diff2d)
-                    conf2d.append(minconf2d)
+            #     # calculate bone lengths and confidence in each bone length
+            #     bone3d = []
+            #     bone2d = []
+            #     conf2d = []
+            #     for pair in OP_EDGE_LIST:
+            #         diff3d = torch.norm(joints3d_op[:,0,pair[0],:] - joints3d_op[:,0,pair[1],:], dim=1) # does not change over time
+            #         diff2d = torch.norm(joints2d_obs[:,:,pair[0],:] - joints2d_obs[:,:,pair[1],:], dim=2)
+            #         minconf2d = torch.min(joints2d_conf[:,:,pair[0]], joints2d_conf[:,:,pair[1]])
+            #         bone3d.append(diff3d)
+            #         bone2d.append(diff2d)
+            #         conf2d.append(minconf2d)
 
-                bone3d = torch.stack(bone3d, dim=1)
-                bone2d = torch.stack(bone2d, dim=2)
-                bone2d = bone2d[np.arange(self.batch_size), best_2d_idx, :]
-                conf2d = torch.stack(conf2d, dim=2)
-                conf2d = conf2d[np.arange(self.batch_size), best_2d_idx, :]
+            #     bone3d = torch.stack(bone3d, dim=1)
+            #     bone2d = torch.stack(bone2d, dim=2)
+            #     bone2d = bone2d[np.arange(self.batch_size), best_2d_idx, :]
+            #     conf2d = torch.stack(conf2d, dim=2)
+            #     conf2d = conf2d[np.arange(self.batch_size), best_2d_idx, :]
 
-                # mean over all
-                mean_bone3d = torch.mean(bone3d, dim=1)
-                mean_bone2d = torch.mean(bone2d*(conf2d > 0.0), dim=1)
+            #     # mean over all
+            #     mean_bone3d = torch.mean(bone3d, dim=1)
+            #     mean_bone2d = torch.mean(bone2d*(conf2d > 0.0), dim=1)
 
-                # approx z based on ratio
-                init_z = self.cam_f[:,0] * (mean_bone3d / mean_bone2d)
-                self.trans[:,:,2] = init_z.unsqueeze(1).expand((self.batch_size, self.seq_len)).detach()
+            #     # approx z based on ratio
+            #     init_z = self.cam_f[:,0] * (mean_bone3d / mean_bone2d)
+            #     self.trans[:,:,2] = init_z.unsqueeze(1).expand((self.batch_size, self.seq_len)).detach()
 
 
     def run(self, observed_data,
@@ -205,7 +207,9 @@ class MotionOptimizer():
                   num_iter=[30, 70, 70],
                   lbfgs_max_iter=20,
                   stages_res_out=None,
-                  fit_gender='neutral'):
+                  fit_gender='neutral',
+                  rel_loss_tol=None,
+                  rel_loss_patience=0):
 
         if len(num_iter) != 3:
             print('Must have num iters for 3 stages! But %d stages were given!' % (len(num_iter)))
@@ -234,10 +238,14 @@ class MotionOptimizer():
                                         max_iter=lbfgs_max_iter,
                                         lr=lr,
                                         line_search_fn=LINE_SEARCH)
+        last_loss = None
+        no_improve = 0
         for i in range(num_iter[0]):
             Logger.log('ITER: %d' % (i))
             self.fitting_loss.cur_optim_step = i
             stats_dict = None
+            loss_holder = [None]
+
             def closure():
                 root_optim.zero_grad()
                 
@@ -246,12 +254,31 @@ class MotionOptimizer():
                 body_pose = self.latent2pose(self.latent_pose)
                 pred_data, _ = self.smpl_results(self.trans, self.root_orient, body_pose, self.betas)
                 # compute data losses only
-                loss, stats_dict = self.fitting_loss.root_fit(observed_data, pred_data)
-                log_cur_stats(stats_dict, loss, iter=i)
+                loss, cur_stats = self.fitting_loss.root_fit(observed_data, pred_data)
+                log_cur_stats(cur_stats, loss, iter=i)
                 loss.backward()
+                loss_holder[0] = loss.detach()
                 return loss
 
             root_optim.step(closure)
+
+            # early stopping for stage 1
+            if rel_loss_tol is not None and rel_loss_patience > 0 and loss_holder[0] is not None:
+                cur_loss = loss_holder[0].item()
+                if last_loss is not None:
+                    improvement = last_loss - cur_loss
+                    if improvement <= 0.0:
+                        no_improve += 1
+                    else:
+                        rel_dec = improvement / max(1.0, abs(last_loss))
+                        if rel_dec < rel_loss_tol:
+                            no_improve += 1
+                        else:
+                            no_improve = 0
+                    if no_improve >= rel_loss_patience:
+                        Logger.log('Early stopping stage 1 at iter %d with loss %.6f' % (i, cur_loss))
+                        break
+                last_loss = cur_loss
 
         body_pose = self.latent2pose(self.latent_pose)
         stage1_pred_data, _ = self.smpl_results(self.trans, self.root_orient, body_pose, self.betas)
@@ -286,8 +313,12 @@ class MotionOptimizer():
                                     lr=lr,
                                     line_search_fn=LINE_SEARCH)
 
+        last_loss = None
+        no_improve = 0
         for i in range(num_iter[1]):
             Logger.log('ITER: %d' % (i))
+            loss_holder = [None]
+
             def closure():
                 smpl_optim.zero_grad()
                 
@@ -302,9 +333,28 @@ class MotionOptimizer():
                 loss, stats_dict = self.fitting_loss.smpl_fit(observed_data, pred_data, self.seq_len)
                 log_cur_stats(stats_dict, loss, iter=i)
                 loss.backward()
+                loss_holder[0] = loss.detach()
                 return loss
 
             smpl_optim.step(closure)
+
+            # early stopping for stage 2
+            if rel_loss_tol is not None and rel_loss_patience > 0 and loss_holder[0] is not None:
+                cur_loss = loss_holder[0].item()
+                if last_loss is not None:
+                    improvement = last_loss - cur_loss
+                    if improvement <= 0.0:
+                        no_improve += 1
+                    else:
+                        rel_dec = improvement / max(1.0, abs(last_loss))
+                        if rel_dec < rel_loss_tol:
+                            no_improve += 1
+                        else:
+                            no_improve = 0
+                    if no_improve >= rel_loss_patience:
+                        Logger.log('Early stopping stage 2 at iter %d with loss %.6f' % (i, cur_loss))
+                        break
+                last_loss = cur_loss
 
         body_pose = self.latent2pose(self.latent_pose)
         stage2_pred_data, _ = self.smpl_results(self.trans, self.root_orient, body_pose, self.betas)
@@ -480,6 +530,8 @@ class MotionOptimizer():
         cur_stage3_nsteps = self.stage3_tune_init_num_frames
         saved_contact_height_weight = self.fitting_loss.loss_weights['contact_height']
         saved_contact_vel_weight = self.fitting_loss.loss_weights['contact_vel']
+        last_loss = None
+        no_improve = 0
         for i in range(num_iter[2]):
             if self.stage3_tune_init_state and i >= self.stage3_tune_init_freeze_start and i < self.stage3_tune_init_freeze_end:
                 # freeze initial state
@@ -512,6 +564,8 @@ class MotionOptimizer():
                 init_motion_scale = float(self.seq_len) / self.stage3_tune_init_num_frames
 
             Logger.log('ITER: %d' % (i))
+            loss_holder = [None]
+
             def closure():
                 motion_optim.zero_grad()
 
@@ -608,9 +662,28 @@ class MotionOptimizer():
 
                 log_cur_stats(stats_dict, loss, iter=i)
                 loss.backward()
+                loss_holder[0] = loss.detach()
                 return loss
 
             motion_optim.step(closure)
+
+            # early stopping for stage 3
+            if rel_loss_tol is not None and rel_loss_patience > 0 and loss_holder[0] is not None:
+                cur_loss = loss_holder[0].item()
+                if last_loss is not None:
+                    improvement = last_loss - cur_loss
+                    if improvement <= 0.0:
+                        no_improve += 1
+                    else:
+                        rel_dec = improvement / max(1.0, abs(last_loss))
+                        if rel_dec < rel_loss_tol:
+                            no_improve += 1
+                        else:
+                            no_improve = 0
+                    if no_improve >= rel_loss_patience:
+                        Logger.log('Early stopping stage 3 at iter %d with loss %.6f' % (i, cur_loss))
+                        break
+                last_loss = cur_loss
 
         body_pose = self.latent2pose(self.latent_pose)
         rollout_joints = rollout_results = None
