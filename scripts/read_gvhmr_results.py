@@ -17,7 +17,9 @@ def load_gvhmr_results(gvhmr_dir, start_frame=None, end_frame=None, fps=30.0):
         coco_seq: (T, 17, 3)
         cam_mat: (3, 3)
         beta_ext: (10,)
-        theta_ext: (T, 24, 3)
+        pose_body: (T, 21, 3)
+        root_orient: (T, 3)
+        trans: (T, 3)
     """
     # --- 1. ファイルパスの構築 ---
     results_path = os.path.join(gvhmr_dir, "hmr4d_results.pt")
@@ -45,8 +47,16 @@ def load_gvhmr_results(gvhmr_dir, start_frame=None, end_frame=None, fps=30.0):
     # pose
     pose_body = smpl_params["body_pose"].numpy().astype(np.float32).reshape(-1, 21, 3)  # (T, 21, 3)
 
+    # global orientation
+    root_orient = smpl_params["global_orient"].numpy().astype(np.float32).reshape(-1, 3)  # (T, 3)
+
+    # transl (camera frame)
+    trans = smpl_params["transl"].numpy().astype(np.float32).reshape(-1, 3)  # (T, 3)
+
     if start_frame is not None and end_frame is not None:
         coco_seq = coco_seq[start_frame:end_frame, :, :]
         pose_body = pose_body[start_frame:end_frame, :, :]
+        root_orient = root_orient[start_frame:end_frame, :]
+        trans = trans[start_frame:end_frame, :]
 
-    return coco_seq, cam_mat, shape, pose_body
+    return coco_seq, cam_mat, shape, pose_body, root_orient, trans
