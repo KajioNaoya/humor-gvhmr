@@ -4,7 +4,7 @@ import torch
 
 from tools.convert_keypoints_to_openpose import convert_coco_seq_to_body25
 
-from humor.fitting.motion_optimizer import MotionOptimizer
+from humor.fitting.motion_optimizer import MotionOptimizer, J_BODY
 from humor.fitting.fitting_utils import NSTAGES, DEFAULT_FOCAL_LEN, load_vposer
 from humor.models.humor_model import HumorModel
 from humor.body_model.body_model import BodyModel
@@ -50,6 +50,10 @@ def build_dummy_inputs(n_timestep=30, image_size=(1080, 1080)):
 def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    # Early stopping settings for LBFGS
+    REL_LOSS_TOL = 1e-3
+    REL_LOSS_PATIENCE = 5
+
     log_dir = "./out/demo_logs"
     mkdir(log_dir)
     log_path = os.path.join(log_dir, f"fit_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
@@ -61,19 +65,17 @@ def main():
     humor_ckpt = "./checkpoints/humor/best_model.pth"
     init_motion_prior_dir = "./checkpoints/init_state_prior_gmm"
 
-    # Build dummy inputs
-    # n_timestep = 30
-    # coco_seq, cam_mat_np, beta_ext_np, theta_ext_np = build_dummy_inputs(
-    #     n_timestep=n_timestep
-    # )
-    coco_seq, cam_mat_np, beta_ext_np, theta_ext_np = load_gvhmr_results(
-        gvhmr_dir="./data/1029_01_GVHMR", start_frame=900, end_frame=1200
+    # Build inputs from GVHMR results
+    coco_seq, cam_mat_np, beta_ext_np, theta_ext_np, root_orient_np, trans_np = load_gvhmr_results(
+        gvhmr_dir="./data/1029_01_GVHMR", start_frame=900, end_frame=1050
     )
     n_timestep = theta_ext_np.shape[0]
     print("coco_seq:", coco_seq[:3, :, :])
     print("cam_mat_np:", cam_mat_np)
     print("beta_ext_np:", beta_ext_np)
     print("theta_ext_np:", theta_ext_np[:3, :, :])
+    print("root_orient_np:", root_orient_np[:3, :])
+    print("trans_np:", trans_np[:3, :])
 
     # Convert COCO17 -> BODY_25
     body25_seq = convert_coco_seq_to_body25(coco_seq)  # (T, 25, 3)
@@ -199,7 +201,7 @@ def main():
         robust_loss_type="bisquare",
         robust_tuning_const=4.6851,
         joint2d_sigma=100.0,
-        stage3_tune_init_state=True,
+        stage3_tune_init_state=False, #True
         stage3_tune_init_num_frames=15,
         stage3_tune_init_freeze_start=30,
         stage3_tune_init_freeze_end=55,
@@ -208,8 +210,43 @@ def main():
         im_dim=(image_size := (1080, 1080)),
     )
 
+    # --------------------------------------------------
+    # Initialize SMPL betas & local body pose from external observations
+    # + initialize root_orient & trans from GVHMR
+    # --------------------------------------------------
+    with torch.no_grad():
+        # shape (betas): copy first 10 components from external estimate
+        # betas_obs: (B, 1, 10) -> (B, 10)
+        ext_betas_10 = betas_obs[:, 0, :]  # (B, 10)
+        num_beta = ext_betas_10.shape[-1]
+        optimizer.betas[:, :num_beta] = ext_betas_10
+
+        # body pose: build (B, T, J_BODY*3) from external local joint angles
+        B_opt, T_opt = B, T
+        body_pose = torch.zeros(
+            (B_opt, T_opt, J_BODY * 3),
+            dtype=torch.float32,
+            device=device,
+        )
+        # theta_ext: (T, 21, 3) -> (B, T, 21, 3)
+        theta_ext_b = theta_ext.unsqueeze(0)
+        num_joints_obs = theta_ext_b.shape[2]
+        num_joints_fill = min(num_joints_obs, J_BODY)
+        body_pose[:, :, : num_joints_fill * 3] = theta_ext_b[
+            :, :, :num_joints_fill, :
+        ].reshape(B_opt, T_opt, num_joints_fill * 3)
+
+        # encode into VPoser latent space
+        optimizer.latent_pose = optimizer.pose2latent(body_pose)
+
+        # root_orient / trans: (T, 3) from GVHMR -> (B, T, 3) as optimizer initialization
+        root_orient_ext = torch.tensor(root_orient_np, dtype=torch.float32, device=device)
+        trans_ext = torch.tensor(trans_np, dtype=torch.float32, device=device)
+        optimizer.root_orient[:, :, :] = root_orient_ext.unsqueeze(0)
+        optimizer.trans[:, :, :] = trans_ext.unsqueeze(0)
+
     # Run optimization
-    optim_result, _ = optimizer.run(
+    optim_result, per_stage_outputs = optimizer.run(
         observed_data,
         data_fps=30,
         lr=lr,
@@ -217,17 +254,38 @@ def main():
         lbfgs_max_iter=lbfgs_max_iter,
         stages_res_out=None,
         fit_gender="neutral",
+        rel_loss_tol=REL_LOSS_TOL,
+        rel_loss_patience=REL_LOSS_PATIENCE,
     )
 
-    trans = optim_result["trans"]  # (B, T, 3)
+    trans = optim_result["trans"]  # (B, T, 3) in camera frame
     pose_body = optim_result["pose_body"]  # (B, T, J_body*3)
+    root_orient = optim_result["root_orient"]  # (B, T, 3) in camera frame
     betas = optim_result["betas"]  # (B, num_betas)
 
+    # Also get motion in the prior (ground) frame where the floor is y=0, if available.
+    # When optim_floor=True, stage3 outputs include:
+    #   'prior_trans'      : (B, T, 3) in ground/prior coordinates
+    #   'prior_root_orient': (B, T, 3) in ground/prior coordinates
+    prior_trans = None
+    prior_root_orient = None
+    if "stage3" in per_stage_outputs:
+        stage3 = per_stage_outputs["stage3"]
+        if "prior_trans" in stage3 and "prior_root_orient" in stage3:
+            prior_trans = stage3["prior_trans"]
+            prior_root_orient = stage3["prior_root_orient"]
+
     # Save to .npz file
-    np.savez("optim_result_vars.npz",
-             trans=trans.cpu().numpy(),
-             pose_body=pose_body.cpu().numpy(),
-             betas=betas.cpu().numpy())
+    # NOTE: stage3 の prior 系変数は grad 付きなので detach() してから .numpy() する
+    np.savez(
+        "optim_result_vars.npz",
+        trans=trans.detach().cpu().numpy(),
+        trans_prior=prior_trans.detach().cpu().numpy(),
+        pose_body=pose_body.detach().cpu().numpy(),
+        root_orient=root_orient.detach().cpu().numpy(),
+        root_orient_prior=prior_root_orient.detach().cpu().numpy(),
+        betas=betas.detach().cpu().numpy(),
+    )
     print("Saved trans, pose_body, betas to optim_result_vars.npz")
 
     print("Optimization finished.")
