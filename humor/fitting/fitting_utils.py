@@ -668,7 +668,14 @@ def perspective_projection(points, rotation, translation,
     points = points + translation.unsqueeze(1)
 
     # Apply perspective distortion
-    projected_points = points / points[:,:,-1].unsqueeze(-1)
+    # z=0 付近での発散と NaN を避けるため、分母となる z に下限を設ける
+    z = points[:, :, -1:].clone()
+    eps = 1e-3
+    # 符号を保ったまま絶対値に下限をかける
+    sign = torch.sign(z)
+    sign[sign == 0] = 1.0
+    z_safe = sign * torch.clamp(z.abs(), min=eps)
+    projected_points = points / z_safe
 
     # Apply camera intrinsics
     projected_points = torch.einsum('bij,bkj->bki', K, projected_points)

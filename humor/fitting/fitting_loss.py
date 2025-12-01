@@ -556,10 +556,13 @@ class FittingLoss(nn.Module):
         last dim.    Args:
             x: tensor: (batch_1, batch_2, ..., batch_k, dim): Observation
             m: tensor: (batch_1, batch_2, ..., batch_k, dim): Mean
-            v: tensor: (batch_1, batch_2, ..., batch_k, dim): Variance    Return:
+            v: tensor: (batch_1, batch_2, ..., batch_k, dim): Variance
+        Return:
             log_prob: tensor: (batch_1, batch_2, ..., batch_k): log probability of
                 each sample. Note that the summation dimension is not kept
         """
+        # 数値安定性のため、分散に下限を設ける（0 や極端に小さい値を防ぐ）
+        v = torch.clamp(v, min=1e-6)
         log_prob = -torch.log(torch.sqrt(v)) - math.log(math.sqrt(2*math.pi)) \
                         - ((x - m)**2 / (2*v))
         log_prob = torch.sum(log_prob, dim=-1)
