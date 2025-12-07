@@ -13,7 +13,7 @@ import torch.optim as optim
 from utils.logging import Logger, mkdir
 from utils.transforms import rotation_matrix_to_angle_axis, batch_rodrigues
 
-from datasets.amass_utils import CONTACT_INDS
+from datasets.amass_utils import CONTACT_INDS, CONTACT_ORDERING
 
 from body_model.utils import SMPL_JOINTS, KEYPT_VERTS, smpl_to_openpose
 
@@ -25,6 +25,12 @@ LINE_SEARCH = 'strong_wolfe'
 J_BODY = len(SMPL_JOINTS)-1 # no root
 
 CONTACT_THRESH = 0.5
+
+# Indices (within CONTACT_ORDERING / CONTACT_INDS) corresponding to left/right foot contacts
+_LEFT_FOOT_CONTACT_NAMES = ['leftFoot', 'leftToeBase']
+_RIGHT_FOOT_CONTACT_NAMES = ['rightFoot', 'rightToeBase']
+LEFT_FOOT_CONTACT_CH = [i for i, name in enumerate(CONTACT_ORDERING) if name in _LEFT_FOOT_CONTACT_NAMES]
+RIGHT_FOOT_CONTACT_CH = [i for i, name in enumerate(CONTACT_ORDERING) if name in _RIGHT_FOOT_CONTACT_NAMES]
 
 class MotionOptimizer():
     ''' Fits SMPL shape and motion to observation sequence '''
@@ -64,6 +70,11 @@ class MotionOptimizer():
         self.stage3_tune_init_freeze_end = stage3_tune_init_freeze_end
         self.stage3_contact_refine_only = stage3_contact_refine_only
         self.im_dim = im_dim
+
+        # Optional external foot contact annotations (e.g., from IMU).
+        # Expected shape: (B, T) boolean tensors when provided.
+        self.ext_left_contact = None
+        self.ext_right_contact = None
 
         #
         # create the optimization variables
@@ -462,6 +473,8 @@ class MotionOptimizer():
                                                         self.betas,
                                                         prior_opt_params,
                                                         self.latent_motion,
+                                                        left_contact=self.ext_left_contact,
+                                                        right_contact=self.ext_right_contact,
                                                         fit_gender=fit_gender)
         stage3_init_pred_data, _ = self.smpl_results(cam_rollout_results['trans'].clone().detach(), 
                                                      cam_rollout_results['root_orient'].clone().detach(),
@@ -589,9 +602,15 @@ class MotionOptimizer():
                 cur_rollout_joints = None
                 cur_contacts = cur_contacts_conf = None
                 cur_cam_trans = cur_cam_root_orient = None
+                left_contact = self.ext_left_contact
+                right_contact = self.ext_right_contact
 
                 if self.stage3_tune_init_state and  i < self.stage3_tune_init_freeze_start:
                     cur_latent_motion = cur_latent_motion[:,:(cur_stage3_nsteps-1)]
+                    left_contact = left_contact[:,:cur_stage3_nsteps]
+                    right_contact = right_contact[:,:cur_stage3_nsteps]
+                    print("cur_latent_motion:", cur_latent_motion.shape)
+                    print("left_contact:", left_contact.shape)
                 # rollout full sequence with current latent dynamics
                 # rollout_results are in prior space, cam_rollout_results are in camera frame
                 rollout_results, cam_rollout_results = self.rollout_latent_motion(cur_trans,
@@ -601,7 +620,9 @@ class MotionOptimizer():
                                                                                 prior_opt_params,
                                                                                 cur_latent_motion,
                                                                                 return_prior=self.cond_prior,
-                                                                                fit_gender=fit_gender)
+                                                                                fit_gender=fit_gender,
+                                                                                left_contact=left_contact,
+                                                                                right_contact=right_contact)
                 cur_trans = rollout_results['trans']
                 cur_root_orient = rollout_results['root_orient']
                 cur_body_pose = rollout_results['pose_body']
@@ -695,7 +716,10 @@ class MotionOptimizer():
                                                                             self.betas,
                                                                             prior_opt_params,
                                                                             self.latent_motion,
-                                                                            fit_gender=fit_gender)
+                                                                            left_contact=self.ext_left_contact,
+                                                                            right_contact=self.ext_right_contact,
+                                                                            fit_gender=fit_gender
+                                                                        )
         body_pose = rollout_results['pose_body']
         self.latent_pose = self.pose2latent(body_pose)
         self.trans = cam_rollout_results['trans']
@@ -949,7 +973,7 @@ class MotionOptimizer():
 
         return infer_results
 
-    def rollout_latent_motion(self, trans, root_orient, body_pose, betas, prior_opt_params, latent_motion,
+    def rollout_latent_motion(self, trans, root_orient, body_pose, betas, prior_opt_params, latent_motion, left_contact=None, right_contact=None,
                                     return_prior=False,
                                     return_vel=False,
                                     fit_gender='neutral',
@@ -1068,8 +1092,69 @@ class MotionOptimizer():
                 # repeat first entry for t0
                 full_contact_conf = torch.cat([full_contact_conf[:,0:1], full_contact_conf], dim=1)
                 full_contacts = torch.cat([full_contacts[:,0:1], full_contacts], dim=1)
-                # print(full_contacts.size())
-                # print(full_contacts)
+
+                # --------------------------------------------------
+                # Override foot contact probabilities using external IMU contacts.
+                # When left/right_contact is True, set corresponding joints' prob to 1.0.
+                # When False, leave model predictions unchanged.
+                # --------------------------------------------------
+                T_full = full_contact_conf.shape[1]
+                device = full_contact_conf.device
+
+                if left_contact is not None:
+                    left_mask = left_contact
+                    if left_mask.dim() == 1:
+                        left_mask = left_mask.unsqueeze(0)
+                    if left_mask.shape[1] != T_full:
+                        raise ValueError(
+                            f"ext_left_contact must have length {T_full}, "
+                            f"but got {left_mask.shape[1]}"
+                        )
+                    left_mask = left_mask.to(device)
+                    left_mask_exp = left_mask.unsqueeze(-1)
+                    left_joint_inds = torch.tensor(
+                        [CONTACT_INDS[i] for i in LEFT_FOOT_CONTACT_CH],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    full_contact_conf[:, :, left_joint_inds] = torch.where(
+                        left_mask_exp,
+                        torch.ones_like(full_contact_conf[:, :, left_joint_inds]),
+                        full_contact_conf[:, :, left_joint_inds],
+                    )
+                    full_contacts[:, :, left_joint_inds] = torch.where(
+                        left_mask_exp,
+                        torch.ones_like(full_contacts[:, :, left_joint_inds]),
+                        full_contacts[:, :, left_joint_inds],
+                    )
+
+                if right_contact is not None:
+                    right_mask = right_contact
+                    if right_mask.dim() == 1:
+                        right_mask = right_mask.unsqueeze(0)
+                    if right_mask.shape[1] != T_full:
+                        raise ValueError(
+                            f"ext_right_contact must have length {T_full}, "
+                            f"but got {right_mask.shape[1]}"
+                        )
+                    right_mask = right_mask.to(device)
+                    right_mask_exp = right_mask.unsqueeze(-1)
+                    right_joint_inds = torch.tensor(
+                        [CONTACT_INDS[i] for i in RIGHT_FOOT_CONTACT_CH],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    full_contact_conf[:, :, right_joint_inds] = torch.where(
+                        right_mask_exp,
+                        torch.ones_like(full_contact_conf[:, :, right_joint_inds]),
+                        full_contact_conf[:, :, right_joint_inds],
+                    )
+                    full_contacts[:, :, right_joint_inds] = torch.where(
+                        right_mask_exp,
+                        torch.ones_like(full_contacts[:, :, right_joint_inds]),
+                        full_contacts[:, :, right_joint_inds],
+                    )
+
                 out_dict['contacts_conf'] = full_contact_conf
                 out_dict['contacts'] = full_contacts
             if is_sampling:

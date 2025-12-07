@@ -171,17 +171,65 @@ def visualize_with_matplotlib(all_vertices, num_frames):
     
     plt.show()
 
-if __name__ == "__main__":
-    result_path = "optim_result_vars.npz"
-    result = np.load(result_path)
-    body_pose = result["pose_body"][0]
-    global_orient = result["root_orient_prior"][0] # 世界座標系
-    transl = result["trans_prior"][0] # 世界座標系
-    betas = result["betas"][0]  # (16,)
-    betas = np.repeat(betas[None, :], transl.shape[0], axis=0)  # (num_frames, 16)
 
+if __name__ == "__main__":
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Visualize HuMoR / GVHMR SMPL results from humor_result.pt "
+            "in world coordinates (smpl_params_global)."
+        )
+    )
+    parser.add_argument(
+        "--result-pt",
+        type=str,
+        default=None,
+        help="Path to humor_result.pt (GVHMR-style dict with smpl_params_global).",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="smplx",
+        choices=["smpl", "smplx"],
+        help="Body model type for visualization.",
+    )
+    args = parser.parse_args()
+    
+    # --------------------------------------------------------------
+    # Load from HuMoR-style GVHMR .pt (humor_result.pt)
+    # --------------------------------------------------------------
+    pt_path = args.result_pt
+    pred = torch.load(pt_path, map_location="cpu")
+    smpl_params = pred["smpl_params_global"]
+
+    # betas: (T, 10) or (10,) etc.
+    betas = smpl_params["betas"].detach().cpu().numpy()
+
+    # body_pose: (T, 63) = (T, 21*3) in axis-angle, as written by demo_mmpose_external_smpl.py
+    body_pose = smpl_params["body_pose"].detach().cpu().numpy()
+
+    # global orientation & translation
+    global_orient = smpl_params["global_orient"].detach().cpu().numpy()
+    transl = smpl_params["transl"].detach().cpu().numpy()
+
+    # Ensure consistent time dimension
+    num_frames = body_pose.shape[0]
+
+    # Normalize betas to (num_frames, num_betas)
+    if betas.ndim == 1:
+        betas = np.repeat(betas[None, :], num_frames, axis=0)
+    elif betas.shape[0] != num_frames:
+        betas = np.repeat(betas[:1, :], num_frames, axis=0)
+
+    # Sanity print
+    print("Loaded from PT:", pt_path)
     print("betas shape:", betas.shape)
     print("body_pose shape:", body_pose.shape)
     print("global_orient shape:", global_orient.shape)
     print("transl shape:", transl.shape)
-    visualize_result(betas, body_pose, global_orient, transl, model_type="smplx")
+
+    visualize_result(
+        betas, body_pose, global_orient, transl, model_type=args.model_type
+    )

@@ -2,6 +2,7 @@ matplotlib
 opencv-python
 scikit-learn
 trimesh
+pandas
 Pillow
 pyrender
 pyglet==1.5.15

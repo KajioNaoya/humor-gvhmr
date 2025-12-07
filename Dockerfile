@@ -87,14 +87,28 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
 # Upgrade pip
 RUN python -m pip install --upgrade pip setuptools wheel
 
-# Install PyTorch 1.6.0 CPU version and torchvision 0.7.0
-RUN pip install torch==1.6.0+cpu torchvision==0.7.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
+# Install a newer CPU-only PyTorch and torchvision (required by MMPose RTMPose; SiLU needs >=1.7)
+RUN pip install torch==1.10.0+cpu torchvision==0.11.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
 
 # Copy requirements file
 COPY requirements.txt /workspace/requirements.txt
 
 # Install Python dependencies from requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+
+# ============================================================================
+# MMPose and related OpenMMLab dependencies
+# ============================================================================
+# NOTE:
+# - This demo uses MMPose for 2D keypoint detection (Halpe/whole-body).
+# - We install mmpose and its dependencies via openmim.
+# - mmpose (RTM* 系など) は mmdet も参照するため、mmdet もインストールします。
+# - mmcv はバージョン制約が厳しいため、mmdet の要求に合わせて明示的にインストールします。
+#   以前のログより、mmcv>=2.0.0rc4,<2.2.0 が必要だったので、その範囲で指定します。
+RUN pip install -U openmim && \
+    mim install "mmcv>=2.0.0rc4,<2.2.0" && \
+    mim install "mmdet" && \
+    mim install "mmpose"
 
 # Set environment variables for rendering
 ENV PYOPENGL_PLATFORM=osmesa

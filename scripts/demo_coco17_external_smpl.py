@@ -14,6 +14,7 @@ from humor.utils.logging import Logger, mkdir
 import datetime
 
 from scripts.read_gvhmr_results import load_gvhmr_results
+from scripts.imu import compute_contacts_from_imu
 
 def build_dummy_inputs(n_timestep=30, image_size=(1080, 1080)):
     """
@@ -67,15 +68,28 @@ def main():
 
     # Build inputs from GVHMR results
     coco_seq, cam_mat_np, beta_ext_np, theta_ext_np, root_orient_np, trans_np = load_gvhmr_results(
-        gvhmr_dir="./data/1029_01_GVHMR", start_frame=900, end_frame=1050
+        gvhmr_dir="./data/1029_01", start_frame=900, end_frame=1050
     )
     n_timestep = theta_ext_np.shape[0]
+
+    # --------------------------------------------------
+    # IMU-based foot contact detection (for future use in optimization)
+    # --------------------------------------------------
+    data_fps = 30.0
+    left_contact, right_contact = compute_contacts_from_imu(
+        T=n_timestep,
+        fps=data_fps,
+    )
+
     print("coco_seq:", coco_seq[:3, :, :])
     print("cam_mat_np:", cam_mat_np)
     print("beta_ext_np:", beta_ext_np)
     print("theta_ext_np:", theta_ext_np[:3, :, :])
     print("root_orient_np:", root_orient_np[:3, :])
     print("trans_np:", trans_np[:3, :])
+    print("left_contact:", left_contact)
+    print("right_contact:", right_contact)
+    input()
 
     # Convert COCO17 -> BODY_25
     body25_seq = convert_coco_seq_to_body25(coco_seq)  # (T, 25, 3)
@@ -201,13 +215,24 @@ def main():
         robust_loss_type="bisquare",
         robust_tuning_const=4.6851,
         joint2d_sigma=100.0,
-        stage3_tune_init_state=False, #True
+        stage3_tune_init_state=True,
         stage3_tune_init_num_frames=15,
         stage3_tune_init_freeze_start=30,
         stage3_tune_init_freeze_end=55,
         stage3_contact_refine_only=False,
         use_chamfer=False,
         im_dim=(image_size := (1080, 1080)),
+    )
+
+    # --------------------------------------------------
+    # Provide IMU-based foot contacts to the optimizer
+    # (used to overwrite per-frame left/right foot contact probabilities)
+    # --------------------------------------------------
+    optimizer.ext_left_contact = torch.tensor(
+        left_contact[None, :], dtype=torch.bool, device=device
+    )
+    optimizer.ext_right_contact = torch.tensor(
+        right_contact[None, :], dtype=torch.bool, device=device
     )
 
     # --------------------------------------------------
@@ -248,7 +273,7 @@ def main():
     # Run optimization
     optim_result, per_stage_outputs = optimizer.run(
         observed_data,
-        data_fps=30,
+        data_fps=data_fps,
         lr=lr,
         num_iter=num_iters,
         lbfgs_max_iter=lbfgs_max_iter,

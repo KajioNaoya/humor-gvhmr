@@ -1,5 +1,6 @@
 *__pycache__*
 *.pyc
+.venv/*
 body_models
 data
 checkpoints
