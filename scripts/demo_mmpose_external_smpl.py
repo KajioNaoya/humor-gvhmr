@@ -20,27 +20,11 @@ from humor.utils.logging import Logger, mkdir
 
 from scripts.read_gvhmr_results import load_gvhmr_results
 from scripts.imu import compute_contacts_from_imu
-
-
-# Try to support both legacy (0.x) and new (1.x) MMPose APIs.
-_MMPPOSE_API = None
-try:
-    # New-style API (mmpose >= 1.x)
-    from mmpose.apis import init_model as _mm_init_model
-    from mmpose.apis import inference_topdown as _mm_inference_topdown
-
-    _MMPPOSE_API = "new"
-except Exception:  # pragma: no cover - best-effort import
-    try:
-        # Legacy API (mmpose 0.x)
-        from mmpose.apis import (  # type: ignore
-            init_pose_model as _mm_init_model,
-            inference_top_down_pose_model as _mm_inference_topdown_legacy,
-        )
-
-        _MMPPOSE_API = "legacy"
-    except Exception:
-        _MMPPOSE_API = None
+from mmpose.apis import init_model as mm_init_model
+from mmpose.apis import inference_topdown as mm_inference_topdown
+from mmdet.apis import init_detector as mm_init_detector
+from mmdet.apis import inference_detector as mm_inference_detector
+from mmengine.registry import init_default_scope
 
 
 def halpe_to_body25_single(halpe_keypoints: np.ndarray) -> np.ndarray:
@@ -166,6 +150,84 @@ def halpe_seq_to_body25_seq(halpe_seq: np.ndarray) -> np.ndarray:
     return body25_seq
 
 
+def _select_person_bbox_from_mmdet_result(
+    det_result,
+    score_thr: float = 0.5,
+) -> np.ndarray:
+    """
+    Extract the highest-scoring person bbox from an MMDetection result.
+
+    Supports both legacy MMDetection outputs (list of ndarrays) and the
+    newer DetDataSample-style outputs where bboxes live in
+    ``result.pred_instances.bboxes``.
+
+    Returns:
+        bboxes (N, 4) in xyxy format. For our single-person case, this will
+        be either shape (1, 4) or (0, 4) if no bbox passes the threshold.
+    """
+    # New-style DetDataSample (MMDetection >= 3.x)
+    # if hasattr(det_result, "pred_instances"):
+    pred_instances = det_result.pred_instances
+    if not hasattr(pred_instances, "bboxes"):
+        return np.zeros((0, 4), dtype=np.float32)
+
+    bboxes = pred_instances.bboxes
+    scores = getattr(pred_instances, "scores", None)
+    labels = getattr(pred_instances, "labels", None)
+
+    if scores is None:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    # Move to CPU numpy for convenience
+    bboxes = bboxes.cpu().numpy()
+    scores = scores.cpu().numpy()
+    if labels is not None:
+        labels = labels.cpu().numpy()
+
+    # Filter to person class if labels are available (COCO person id = 0)
+    if labels is not None:
+        person_mask = labels == 0
+        bboxes = bboxes[person_mask]
+        scores = scores[person_mask]
+
+    if bboxes.size == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    score_mask = scores >= score_thr
+    bboxes = bboxes[score_mask]
+    scores = scores[score_mask]
+    if bboxes.size == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    best_idx = int(np.argmax(scores))
+    return bboxes[best_idx : best_idx + 1].astype(np.float32)
+
+    # Legacy-style outputs (list of ndarrays, one per class)
+    # if isinstance(det_result, tuple):
+    #     det_result = det_result[0]
+
+    # if isinstance(det_result, list) and len(det_result) > 0:
+    #     # Assume COCO-style ordering: index 0 is person
+    #     person_dets = det_result[0]
+    #     if person_dets is None or person_dets.size == 0:
+    #         return np.zeros((0, 4), dtype=np.float32)
+
+    #     # person_dets: (num_dets, 5) -> [x1, y1, x2, y2, score]
+    #     bboxes = person_dets[:, :4]
+    #     scores = person_dets[:, 4]
+
+    #     score_mask = scores >= score_thr
+    #     bboxes = bboxes[score_mask]
+    #     scores = scores[score_mask]
+    #     if bboxes.size == 0:
+    #         return np.zeros((0, 4), dtype=np.float32)
+
+    #     best_idx = int(np.argmax(scores))
+    #     return bboxes[best_idx : best_idx + 1].astype(np.float32)
+
+    # return np.zeros((0, 4), dtype=np.float32)
+
+
 def run_mmpose_halpe_on_video(
     pose_config: str,
     pose_checkpoint: str,
@@ -173,6 +235,9 @@ def run_mmpose_halpe_on_video(
     start_frame: int,
     end_frame: int,
     device: Optional[str] = None,
+    det_config: Optional[str] = None,
+    det_checkpoint: Optional[str] = None,
+    det_score_thr: float = 0.5,
 ) -> Tuple[np.ndarray, Tuple[int, int]]:
     """
     Run an MMPose whole-body model (Halpe / COCO-WholeBody) on a segment of a video.
@@ -188,17 +253,16 @@ def run_mmpose_halpe_on_video(
         end_frame: Exclusive frame index.
         device: Device string for MMPose model ("cuda:0", "cpu", ...). If None,
                 chooses CUDA if available.
+        det_config: Optional path to an MMDetection config (.py) for the
+            person detector. If provided together with ``det_checkpoint``, a
+            detector will be run per-frame to estimate the person bbox.
+        det_checkpoint: Optional path or URL to an MMDetection checkpoint (.pth).
+        det_score_thr: Detection score threshold for selecting the person bbox.
 
     Returns:
         halpe_seq (T, K, 3): detected keypoints per frame.
         image_size (H, W): size of the processed frames.
     """
-    if _MMPPOSE_API is None:
-        raise ImportError(
-            "mmpose is required to run this demo, but a compatible API could not be "
-            "imported. Please ensure that a stable mmpose version is installed."
-        )
-
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -219,11 +283,15 @@ def run_mmpose_halpe_on_video(
             f"total_frames={total_frames}"
         )
 
-    # Initialize MMPose model
-    if _MMPPOSE_API == "new":
-        pose_model = _mm_init_model(pose_config, pose_checkpoint, device=device)
-    else:  # legacy
-        pose_model = _mm_init_model(pose_config, pose_checkpoint, device=device)
+    # Initialize MMPose model (MMPose >= 1.x new API)
+    pose_model = mm_init_model(pose_config, pose_checkpoint, device=device)
+
+    # Optional: initialize person detector (MMDetection).
+    det_model = None
+    if det_config is not None and det_checkpoint is not None:
+        # Ensure MMDetection's scope is active while building the detector
+        init_default_scope("mmdet")
+        det_model = mm_init_detector(det_config, det_checkpoint, device=device)
 
     halpe_list: List[np.ndarray] = []
     img_h, img_w = None, None
@@ -237,63 +305,59 @@ def run_mmpose_halpe_on_video(
         if frame_idx >= start_frame:
             img_h, img_w = img.shape[:2]
 
-            # Single-person assumption: use full image as bbox.
-            # For the new API, inference_topdown expects either an array of bboxes
-            # or a list of dicts. We pass a single full-image bbox.
-            bbox = np.array(
-                [[0.0, 0.0, float(img_w - 1), float(img_h - 1)]],
-                dtype=np.float32,
+            # ------------------------------------------------------------------
+            # 1) (Optional) run person detector to get bbox in the frame
+            # ------------------------------------------------------------------
+            bboxes = None
+            if det_model is not None:
+                # MMDetection transforms (e.g., PackDetInputs) live under the
+                # "mmdet" scope, so make sure it is active before calling
+                # inference_detector. Otherwise, MMEngine might try to look for
+                # these transforms in the "mmpose" scope and fail.
+                init_default_scope("mmdet")
+                det_result = mm_inference_detector(det_model, img)
+                bboxes = _select_person_bbox_from_mmdet_result(
+                    det_result, score_thr=det_score_thr
+                )
+                if bboxes.shape[0] == 0:
+                    # No valid detection for this frame -> return an all-zero
+                    # keypoint array consistent with other frames.
+                    if num_kpts is None:
+                        num_kpts = 133
+                    halpe_list.append(np.zeros((num_kpts, 3), dtype=np.float32))
+                    frame_idx += 1
+                    continue
+            print("bboxes:", bboxes)
+
+            # ------------------------------------------------------------------
+            # 2) Run MMPose top-down pose estimator inside the bbox
+            # ------------------------------------------------------------------
+            # Switch to the "mmpose" scope so that the MMPose transforms
+            # and models are correctly resolved inside inference_topdown.
+            init_default_scope("mmpose")
+            pose_results = mm_inference_topdown(
+                pose_model,
+                img,
+                bboxes=bboxes,
             )
 
-            if _MMPPOSE_API == "new":
-                pose_results = _mm_inference_topdown(pose_model, img, bbox)
-
-                if pose_results:
-                    # pose_results is a list of PoseDataSample
-                    data_sample = pose_results[0]
-                    pred_instances = data_sample.pred_instances
-                    # (N_instances, K, 2) and (N_instances, K)
-                    keypoints = pred_instances.keypoints[0].astype(np.float32)
-                    scores = pred_instances.keypoint_scores[0].astype(np.float32)
-                    kpts = np.concatenate(
-                        [keypoints, scores[..., None]], axis=-1
-                    )  # (K, 3)
-                    if num_kpts is None:
-                        num_kpts = kpts.shape[0]
-                    halpe_list.append(kpts)
-                else:
-                    if num_kpts is None:
-                        num_kpts = 133
-                    halpe_list.append(np.zeros((num_kpts, 3), dtype=np.float32))
+            if pose_results:
+                # pose_results is a list of PoseDataSample
+                data_sample = pose_results[0]
+                pred_instances = data_sample.pred_instances
+                # (N_instances, K, 2) and (N_instances, K)
+                keypoints = pred_instances.keypoints[0].astype(np.float32)
+                scores = pred_instances.keypoint_scores[0].astype(np.float32)
+                kpts = np.concatenate(
+                    [keypoints, scores[..., None]], axis=-1
+                )  # (K, 3)
+                if num_kpts is None:
+                    num_kpts = kpts.shape[0]
+                halpe_list.append(kpts)
             else:
-                # Legacy 0.x API
-                person_results = [
-                    {
-                        "bbox": np.array(
-                            [0.0, 0.0, float(img_w - 1), float(img_h - 1), 1.0],
-                            dtype=np.float32,
-                        )
-                    }
-                ]
-                pose_results, _ = _mm_inference_topdown_legacy(
-                    pose_model,
-                    img,
-                    person_results,
-                    bbox_thr=0.0,
-                    format="xyxy",
-                    dataset=pose_model.cfg.data["test"].type,
-                )
-
-                if pose_results and "keypoints" in pose_results[0]:
-                    kpts = pose_results[0]["keypoints"].astype(np.float32)
-                    if num_kpts is None:
-                        num_kpts = kpts.shape[0]
-                    halpe_list.append(kpts)
-                else:
-                    # No detection: fill with zeros
-                    if num_kpts is None:
-                        num_kpts = 133
-                    halpe_list.append(np.zeros((num_kpts, 3), dtype=np.float32))
+                if num_kpts is None:
+                    num_kpts = 133
+                halpe_list.append(np.zeros((num_kpts, 3), dtype=np.float32))
 
         frame_idx += 1
 
@@ -377,6 +441,10 @@ def main():
         args.device if args.device is not None else ("cuda:0" if torch.cuda.is_available() else "cpu")
     )
 
+    # DET_CONFIG = "./checkpoints/mmdet/sparse_rcnn_r50_fpn_1x_coco.py"
+    # DET_CHECKPOINT = "./checkpoints/mmdet/sparse_rcnn_r50_fpn_1x_coco_20201222_214453-dc79b137.pth"
+    DET_CONFIG = "./checkpoints/mmdet/rtmdet_tiny_8xb32-300e_coco.py"
+    DET_CHECKPOINT = "./checkpoints/mmdet/rtmdet_tiny_8xb32-300e_coco_20220902_112124-756f7f01.pth"
     POSE_CONFIG = "./checkpoints/mmpose/rtmpose-m_8xb512-700e_body8-halpe26-256x192.py"
     POSE_CHECKPOINT = "./checkpoints/mmpose/rtmpose-m_simcc-body7_pt-body7-halpe26_700e-256x192-4d3e73dd_20230605.pth"
 
@@ -425,6 +493,9 @@ def main():
         start_frame=args.start_frame,
         end_frame=args.end_frame,
         device=str(device),
+        det_config=DET_CONFIG,
+        det_checkpoint=DET_CHECKPOINT,
+        det_score_thr=0.5,
     )
 
     if halpe_seq.shape[0] != n_timestep:

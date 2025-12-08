@@ -1,6 +1,11 @@
 from demo_mmpose_external_smpl import run_mmpose_halpe_on_video, halpe_seq_to_body25_seq
 import cv2
 
+# DET_CONFIG = "./checkpoints/mmdet/sparse_rcnn_r50_fpn_1x_coco.py"
+# DET_CHECKPOINT = "./checkpoints/mmdet/sparse_rcnn_r50_fpn_1x_coco_20201222_214453-dc79b137.pth"
+DET_CONFIG = "./checkpoints/mmdet/rtmdet_tiny_8xb32-300e_coco.py"
+DET_CHECKPOINT = "./checkpoints/mmdet/rtmdet_tiny_8xb32-300e_coco_20220902_112414-78e30dcc.pth"
+
 POSE_CONFIG = "./checkpoints/mmpose/rtmpose-m_8xb512-700e_body8-halpe26-256x192.py"
 POSE_CHECKPOINT = "./checkpoints/mmpose/rtmpose-m_simcc-body7_pt-body7-halpe26_700e-256x192-4d3e73dd_20230605.pth"
 
@@ -14,6 +19,9 @@ halpe_seq, (img_h, img_w) = run_mmpose_halpe_on_video(
     start_frame=0,
     end_frame=None,
     device="cpu",
+    det_config=DET_CONFIG,
+    det_checkpoint=DET_CHECKPOINT,
+    det_score_thr=0.5,
 )
 body25_seq = halpe_seq_to_body25_seq(halpe_seq)
 
