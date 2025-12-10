@@ -8,7 +8,10 @@ import trimesh
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from utils.torch import copy2cpu as c2c
+try:
+    from utils.torch import copy2cpu as c2c
+except ImportError:
+    from humor.utils.torch import copy2cpu as c2c
 
 smpl_connections = [[11, 8], [8, 5], [5, 2], [2, 0], [10, 7], [7, 4], [4, 1], [1, 0], 
                 [0, 3], [3, 6], [6, 9], [9, 12], [12, 15], [12, 13], [13, 16], [16, 18], 
@@ -343,4 +346,4 @@ def viz_results(body_pred, body_gt, fps, viz_out_dir=None, base_name=None, conta
             shutil.rmtree(comparison_out_path)
 
 # avoid cyclic dependency
-from viz.mesh_viewer import MeshViewer
+# from viz.mesh_viewer import MeshViewer
