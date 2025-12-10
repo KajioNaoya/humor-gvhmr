@@ -14,7 +14,7 @@ from datasets.amass_utils import CONTACT_INDS, NUM_BODY_JOINTS
 from datasets.amass_utils import RETURN_CONFIGS
 from datasets.amass_utils import data_name_list, data_dim
 
-from utils.logging import Logger
+from humor.utils.logging import Logger
 from torch.utils.data import Dataset, DataLoader
 from body_model.utils import SMPL_JOINTS
 from utils.torch import copy2cpu as c2c

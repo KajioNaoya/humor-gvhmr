@@ -444,7 +444,7 @@ def main():
     # DET_CONFIG = "./checkpoints/mmdet/sparse_rcnn_r50_fpn_1x_coco.py"
     # DET_CHECKPOINT = "./checkpoints/mmdet/sparse_rcnn_r50_fpn_1x_coco_20201222_214453-dc79b137.pth"
     DET_CONFIG = "./checkpoints/mmdet/rtmdet_tiny_8xb32-300e_coco.py"
-    DET_CHECKPOINT = "./checkpoints/mmdet/rtmdet_tiny_8xb32-300e_coco_20220902_112124-756f7f01.pth"
+    DET_CHECKPOINT = "./checkpoints/mmdet/rtmdet_tiny_8xb32-300e_coco_20220902_112414-78e30dcc.pth"
     POSE_CONFIG = "./checkpoints/mmpose/rtmpose-m_8xb512-700e_body8-halpe26-256x192.py"
     POSE_CHECKPOINT = "./checkpoints/mmpose/rtmpose-m_simcc-body7_pt-body7-halpe26_700e-256x192-4d3e73dd_20230605.pth"
 
@@ -616,8 +616,8 @@ def main():
         "points3d": [0.0, 0.0, 0.0],
         "pose_prior": [0.04, 0.04, 0.0],
         "shape_prior": [0.05, 0.05, 0.05],
-        "motion_prior": [0.0, 0.0, 0.075],
-        "init_motion_prior": [0.0, 0.0, 0.075],
+        "motion_prior": [0.0, 0.0, 0.01], #"motion_prior": [0.0, 0.0, 0.075],
+        "init_motion_prior": [0.0, 0.0, 0.01], #"init_motion_prior": [0.0, 0.0, 0.075],
         "joint_consistency": [0.0, 0.0, 100.0],
         "bone_length": [0.0, 0.0, 2000.0],
         "joints3d_smooth": [100.0, 100.0, 0.0],

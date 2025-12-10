@@ -17,7 +17,7 @@ import numpy as np
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from utils.logging import Logger, cp_files
+from humor.utils.logging import Logger, cp_files
 
 from models.humor_model import HumorModel
 from datasets.amass_discrete_dataset import AmassDiscreteDataset

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.logging import Logger
+from humor.utils.logging import Logger
 from torch.distributions import MixtureSameFamily, Categorical, Normal, MultivariateNormal
 
 from fitting.fitting_utils import OP_NUM_JOINTS, perspective_projection, apply_robust_weighting, gmof

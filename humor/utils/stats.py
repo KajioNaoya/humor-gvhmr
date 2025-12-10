@@ -9,7 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from datetime import datetime, timedelta
 
-from utils.logging import Logger
+from humor.utils.logging import Logger
 
 class AverageMeter(object):
     """Computes and stores the average and current scalar value"""

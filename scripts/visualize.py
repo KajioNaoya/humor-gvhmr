@@ -2,12 +2,12 @@ import os
 import sys
 # sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import smplx
 import numpy as np
 import torch
 import trimesh
 import cv2
 
+from humor.body_model.body_model import BodyModel
 from humor.viz.mesh_viewer import MeshViewer
 from humor.viz.utils import create_video
 
@@ -17,7 +17,7 @@ def visualize_result(
     body_pose,
     global_orient,
     transl,
-    model_type="smpl",
+    model_type="smplx",
     use_meshviewer=True,
     return_vertices=False,
     fps=30,
@@ -27,7 +27,7 @@ def visualize_result(
     body_pose: (n, 63)
     global_orient: (n, 3)
     transl: (n, 3)
-    model_type: "smpl" or "smplx"
+    model_type: "smplh" or "smplx"
     """
     # 入力をテンソルに変換
     if isinstance(betas, np.ndarray):
@@ -51,63 +51,72 @@ def visualize_result(
     
     num_frames = betas.shape[0]
 
-    # モデルパスの設定
-    if model_type == "smpl":
-        print("SMPL model is not supported")
-        # model_path = "SMPL_models/SMPL_NEUTRAL.pkl"
-    elif model_type == "smplx":
-        model_path = "body_models/smplx/SMPLX_NEUTRAL.npz"
+    # BodyModel 用モデルパスと beta 次元
+    model_type = model_type.lower()
+    if model_type == "smplx":
+        bm_path = "body_models/smplx/SMPLX_NEUTRAL.npz"
+        num_betas_model = 10
+    elif model_type == "smplh":
+        bm_path = "body_models/smplh/neutral/model.npz"
+        num_betas_model = 16
     else:
-        raise ValueError(f"Invalid model type: {model_type}")
-    
-    # SMPLモデルをsmplx.createで作成
-    model = smplx.create(
-        model_path=model_path,
+        raise ValueError(f"Invalid model type for visualization: {model_type}")
+
+    if not os.path.exists(bm_path):
+        raise FileNotFoundError(f"Body model not found at: {bm_path}")
+
+    device = torch.device("cpu")
+
+    # betas を BodyModel の num_betas に合わせてパディング／切り詰め
+    betas = betas.to(device)
+    body_pose = body_pose.to(device)
+    global_orient = global_orient.to(device)
+    transl = transl.to(device)
+
+    betas_model = torch.zeros(num_frames, num_betas_model, dtype=torch.float32, device=device)
+    b_src = betas
+    if b_src.shape[0] != num_frames:
+        # 時間次元が合わない場合は先頭フレームを複製
+        b_src = b_src[:1, :].expand(num_frames, -1)
+    max_copy = min(b_src.shape[1], num_betas_model)
+    betas_model[:, :max_copy] = b_src[:, :max_copy]
+
+    # BodyModel を構築
+    body_model = BodyModel(
+        bm_path=bm_path,
+        num_betas=num_betas_model,
+        batch_size=num_frames,
+        use_vtx_selector=True,   # joints 用の追加頂点も含める
         model_type=model_type,
-        create_global_orient=True,
-        create_body_pose=True,
-        create_betas=True,
-        create_transl=True,
-        batch_size=1,
-        device="cpu"
+    ).to(device)
+
+    # SMPL 頂点・faces を計算
+    body_pose_flat = body_pose.reshape(num_frames, -1)  # (T,63)
+    smpl_out = body_model(
+        betas=betas_model,
+        pose_body=body_pose_flat,
+        root_orient=global_orient,
+        trans=transl,
+        return_dict=True,
     )
-    model.eval()
+    all_vertices_np = smpl_out["v"].detach().cpu().numpy()   # (T, Nv, 3)
+    faces = smpl_out["f"].detach().cpu().numpy()             # (F, 3)
 
-    # モデルが期待するベータ数（shape parameters）の次元に合わせる
-    # SMPL/SMPL-X の shapecoeff 数と、最適化結果のベータ次元数が異なると
-    # smplx.lbs.blend_shapes 内の einsum で次元不一致エラーが出るため、
-    # ここでモデル側の次元に揃える（多い分は切り捨て、足りない分は 0 埋め）。
-    num_betas_model = model.betas.shape[1]
-    if betas.shape[1] > num_betas_model:
-        # 余分な次元は先頭から使用し、残りは捨てる
-        betas = betas[:, :num_betas_model]
-    elif betas.shape[1] < num_betas_model:
-        # 足りない次元は 0 でパディング
-        pad = betas.new_zeros((betas.shape[0], num_betas_model - betas.shape[1]))
-        betas = torch.cat([betas, pad], dim=1)
-
-    # 顔情報（メッシュ接続）を取得
-    faces = None
-    if hasattr(model, "faces"):
-        faces = model.faces
-    elif hasattr(model, "faces_tensor"):
-        faces = model.faces_tensor.detach().cpu().numpy()
-
-    # 各フレームのメッシュを生成
-    all_vertices = []
-    for i in range(num_frames):
-        output = model(
-            betas=betas[i : i + 1],
-            body_pose=body_pose[i : i + 1],
-            global_orient=global_orient[i : i + 1],
-            transl=transl[i : i + 1],
-            return_verts=True,
-        )
-        all_vertices.append(output.vertices.squeeze(0).detach().cpu().numpy())
+    all_vertices = [v for v in all_vertices_np]
 
     # 3D描画（MeshViewerを使用してメッシュとして表示）
     if use_meshviewer and faces is not None:
-        visualize_with_meshviewer(all_vertices, faces, fps=fps)
+        all_trimesh = [trimesh.Trimesh(vertices=v, faces=faces, process=False) for v in all_vertices]
+        mv = MeshViewer(
+            width=1080,
+            height=1080,
+            use_offscreen=False,
+            follow_camera=True,
+            camera_intrinsics=None,
+        )
+        mv.add_mesh_seq(all_trimesh)
+        mv.add_ground()
+        mv.animate(fps=fps)
 
     if return_vertices:
         return all_vertices, faces

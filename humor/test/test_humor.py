@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from utils.config import TestConfig
-from utils.logging import Logger, class_name_to_file_name, mkdir, cp_files
+from humor.utils.logging import Logger, class_name_to_file_name, mkdir, cp_files
 from utils.torch import get_device, save_state, load_state
 from utils.stats import StatTracker
 from utils.transforms import rotation_matrix_to_angle_axis

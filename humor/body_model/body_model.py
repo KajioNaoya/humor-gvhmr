@@ -34,9 +34,10 @@ class BodyModel(nn.Module):
         if self.use_vtx_selector:
             cur_vertex_ids = vertex_ids[model_type]
         data_struct = None
-        if '.npz' in bm_path:
-            # smplx does not support .npz by default, so have to load in manually
-            smpl_dict = np.load(bm_path, encoding='latin1')
+        if '.npz' in bm_path and model_type != 'smplx':
+            # smplh/smpl の .npz にはオブジェクト配列が含まれるため allow_pickle=True が必要
+            # SMPLX 用 .npz は smplx ライブラリ側に処理を任せる
+            smpl_dict = np.load(bm_path, allow_pickle=True)
             data_struct = Struct(**smpl_dict)
             # print(smpl_dict.files)
             if model_type == 'smplh':
@@ -45,26 +46,35 @@ class BodyModel(nn.Module):
                 data_struct.hands_meanl = np.zeros((15 * 3))
                 data_struct.hands_meanr = np.zeros((15 * 3))
                 V, D, B = data_struct.shapedirs.shape
-                data_struct.shapedirs = np.concatenate([data_struct.shapedirs, np.zeros((V, D, SMPL.SHAPE_SPACE_DIM-B))], axis=-1) # super hacky way to let smplh use 16-size beta
+                # super hacky way to let smplh use 16-size beta
+                data_struct.shapedirs = np.concatenate(
+                    [data_struct.shapedirs, np.zeros((V, D, SMPL.SHAPE_SPACE_DIM - B))],
+                    axis=-1
+                )
         kwargs = {
-                'model_type' : model_type,
-                'data_struct' : data_struct,
                 'num_betas': num_betas,
-                'batch_size' : batch_size,
-                'num_expression_coeffs' : num_expressions,
-                'vertex_ids' : cur_vertex_ids,
-                'use_pca' : False,
-                'flat_hand_mean' : True
+                'batch_size': batch_size,
+                'num_expression_coeffs': num_expressions,
+                'use_pca': False,
+                'flat_hand_mean': True
         }
         assert(model_type in ['smpl', 'smplh', 'smplx'])
         if model_type == 'smpl':
-            self.bm = SMPL(bm_path, **kwargs)
+            self.bm = SMPL(bm_path, data_struct=data_struct, **kwargs)
             self.num_joints = SMPL.NUM_JOINTS
         elif model_type == 'smplh':
-            self.bm = SMPLH(bm_path, **kwargs)
+            self.bm = SMPLH(bm_path, data_struct=data_struct, **kwargs)
             self.num_joints = SMPLH.NUM_JOINTS
         elif model_type == 'smplx':
-            self.bm = SMPLX(bm_path, **kwargs)
+            # NOTE: SMPLX には model_type や vertex_ids を渡さず、必要最低限の引数のみを指定する
+            kwargs_smplx = {
+                'num_betas': num_betas,
+                'batch_size': batch_size,
+                'num_expression_coeffs': num_expressions,
+                'use_pca': False,
+                'flat_hand_mean': True
+            }
+            self.bm = SMPLX(bm_path, **kwargs_smplx)
             self.num_joints = SMPLX.NUM_JOINTS
 
         self.model_type = model_type

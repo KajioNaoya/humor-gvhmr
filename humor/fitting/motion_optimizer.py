@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from utils.logging import Logger, mkdir
+from humor.utils.logging import Logger, mkdir
 from utils.transforms import rotation_matrix_to_angle_axis, batch_rodrigues
 
 from datasets.amass_utils import CONTACT_INDS, CONTACT_ORDERING

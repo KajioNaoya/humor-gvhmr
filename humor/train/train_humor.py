@@ -13,7 +13,7 @@ from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 
 from utils.config import TrainConfig
-from utils.logging import Logger, class_name_to_file_name, mkdir, cp_files
+from humor.utils.logging import Logger, class_name_to_file_name, mkdir, cp_files
 from utils.torch import get_device, save_state, load_state
 from utils.stats import StatTracker
 
