@@ -11,6 +11,7 @@ from humor.fitting.fitting_utils import (
 )
 from humor.body_model.body_model import BodyModel
 from humor.body_model.utils import SMPL_JOINTS, smpl_to_openpose
+from humor.utils.transforms import batch_rodrigues, rotation_matrix_to_angle_axis
 
 from scripts.read_gvhmr_results import load_gvhmr_results
 from scripts.demo_mmpose_external_smpl import (
@@ -39,6 +40,59 @@ def build_camera_matrix(
         dtype=np.float32,
     )
     return cam_mat_np
+
+
+def compute_rotation_between_vectors(v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
+    """
+    Compute rotation matrix that rotates v1 to v2.
+    
+    Args:
+        v1: (3,) source vector (normalized)
+        v2: (3,) target vector (normalized)
+    
+    Returns:
+        R: (3, 3) rotation matrix such that R @ v1 = v2
+    """
+    device = v1.device
+    
+    # Normalize vectors
+    v1 = v1 / (v1.norm() + 1e-8)
+    v2 = v2 / (v2.norm() + 1e-8)
+    
+    # Check if vectors are parallel (or anti-parallel)
+    dot = torch.dot(v1, v2)
+    
+    # If vectors are nearly parallel, return identity or 180-degree rotation
+    if abs(dot) > 1.0 - 1e-6:
+        if dot > 0:
+            # Same direction: identity
+            return torch.eye(3, device=device, dtype=v1.dtype)
+        else:
+            # Opposite direction: 180-degree rotation around perpendicular axis
+            # Find a perpendicular vector
+            if abs(v1[0]) < 0.9:
+                perp = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=v1.dtype)
+            else:
+                perp = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=v1.dtype)
+            axis = torch.cross(v1, perp)
+            axis = axis / (axis.norm() + 1e-8)
+            # 180-degree rotation
+            angle = torch.tensor(np.pi, device=device, dtype=v1.dtype)
+            axis_angle = axis * angle
+            return batch_rodrigues(axis_angle.unsqueeze(0))[0]
+    
+    # Compute rotation axis (perpendicular to both vectors)
+    axis = torch.cross(v1, v2)
+    axis = axis / (axis.norm() + 1e-8)
+    
+    # Compute rotation angle
+    angle = torch.acos(torch.clamp(dot, min=-1.0, max=1.0))
+    
+    # Convert axis-angle to rotation matrix
+    axis_angle = axis * angle
+    R = batch_rodrigues(axis_angle.unsqueeze(0))[0]
+    
+    return R
 
 
 def smpl_body25_keypoints(
@@ -575,6 +629,71 @@ def main():
     print("Optimization finished.")
 
     # ------------------------------------------------------------------ #
+    # 8.5) Compute ground plane and camera-to-world rotation
+    # ------------------------------------------------------------------ #
+    # Recompute final joints3d_op with optimized parameters
+    left_ankle_idx = SMPL_JOINTS["leftFoot"]
+    right_ankle_idx = SMPL_JOINTS["rightFoot"]
+    pose_body_final = theta_ext_const.clone()  # (T, 21, 3)
+    pose_body_final[:, left_ankle_idx, :] += ankle_delta[:, 0, :]
+    pose_body_final[:, right_ankle_idx, :] += ankle_delta[:, 1, :]
+    body_pose_flat_final = pose_body_final.reshape(T_seq, -1)  # (T, 21*3)
+
+    joints3d_op_final = smpl_body25_keypoints(
+        body_model=body_model,
+        betas=betas_batch,
+        body_pose=body_pose_flat_final,
+        root_orient=root_orient_const,
+        transl=transl_var,
+    )  # (T, 25, 3)
+
+    # Extract foot keypoints (BODY_25 indices: LBigToe=19, LSmallToe=20, LHeel=21, RBigToe=22, RSmallToe=23, RHeel=24)
+    left_ids = torch.tensor([19, 20, 21], dtype=torch.long, device=device)
+    right_ids = torch.tensor([22, 23, 24], dtype=torch.long, device=device)
+    left_pos_final = joints3d_op_final[:, left_ids, :]  # (T, 3, 3)
+    right_pos_final = joints3d_op_final[:, right_ids, :]  # (T, 3, 3)
+
+    # Collect contact points for plane estimation
+    pts_list = []
+    if left_contact.any():
+        pts_list.append(left_pos_final[left_contact].reshape(-1, 3))
+    if right_contact.any():
+        pts_list.append(right_pos_final[right_contact].reshape(-1, 3))
+
+    R_cam2world = None
+    if len(pts_list) > 0:
+        contact_pts = torch.cat(pts_list, dim=0)  # (M, 3)
+        
+        if contact_pts.shape[0] >= 3:
+            # Compute plane using SVD
+            X = contact_pts.detach()
+            centroid = X.mean(dim=0, keepdim=True)  # (1, 3)
+            Xc = X - centroid
+            _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
+            normal_cam = Vh[-1]  # (3,) - plane normal in camera coordinates
+            normal_cam = normal_cam / (normal_cam.norm() + 1e-8)
+            
+            # Determine world Y-axis direction based on normal's Y component
+            # If normal[1] < 0, then -normal points upward (world Y+)
+            if normal_cam[1] > 0:
+                world_y_dir = -normal_cam
+            else:
+                world_y_dir = normal_cam
+            
+            # World coordinate system Y-axis
+            world_y_axis = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=normal_cam.dtype)
+            
+            # Compute rotation matrix from camera to world coordinates
+            R_cam2world = compute_rotation_between_vectors(world_y_dir, world_y_axis)
+            print(f"Computed camera-to-world rotation matrix")
+            print(f"Ground plane normal (camera): {normal_cam.cpu().numpy()}")
+            print(f"World Y direction (camera): {world_y_dir.cpu().numpy()}")
+        else:
+            print("Warning: Not enough contact points to estimate ground plane. Skipping global coordinate conversion.")
+    else:
+        print("Warning: No contact points found. Skipping global coordinate conversion.")
+
+    # ------------------------------------------------------------------ #
     # 9) Save updated SMPL params in GVHMR format
     # ------------------------------------------------------------------ #
     gvhmr_results_path = os.path.join(args.gvhmr_dir, "hmr4d_results.pt")
@@ -615,6 +734,46 @@ def main():
         cam_mat_np, dtype=torch.float32
     ).unsqueeze(0).repeat(T_opt, 1, 1)
     gvhmr_pred["K_fullimg"] = cam_mat_full
+
+    # ------------------------------------------------------------------ #
+    # 10) Compute and save smpl_params_global
+    # ------------------------------------------------------------------ #
+    smpl_params_global = gvhmr_pred.get("smpl_params_global", {})
+    
+    if R_cam2world is not None:
+        # Convert global_orient from axis-angle to rotation matrix
+        global_orient_mat = batch_rodrigues(global_orient_out.reshape(-1, 3))  # (T, 3, 3)
+        
+        # Apply camera-to-world rotation: R_world = R_cam2world @ R_cam
+        R_cam2world_expanded = R_cam2world.unsqueeze(0).expand(T_opt, 3, 3)  # (T, 3, 3)
+        global_orient_world_mat = torch.matmul(R_cam2world_expanded, global_orient_mat)  # (T, 3, 3)
+        
+        # Convert back to axis-angle
+        global_orient_world = rotation_matrix_to_angle_axis(
+            global_orient_world_mat.reshape(-1, 3, 3)
+        ).reshape(T_opt, 3)  # (T, 3)
+        
+        # Transform translation: t_world = R_cam2world @ t_cam
+        transl_world = torch.matmul(
+            R_cam2world_expanded,
+            transl_out.unsqueeze(-1)
+        ).squeeze(-1)  # (T, 3)
+        
+        smpl_params_global["betas"] = betas_10_t
+        smpl_params_global["body_pose"] = pose_body_out
+        smpl_params_global["global_orient"] = global_orient_world
+        smpl_params_global["transl"] = transl_world
+        
+        print("Computed smpl_params_global using ground plane-based coordinate transformation")
+    else:
+        # If no rotation matrix computed, use incam values (fallback)
+        smpl_params_global["betas"] = betas_10_t
+        smpl_params_global["body_pose"] = pose_body_out
+        smpl_params_global["global_orient"] = global_orient_out
+        smpl_params_global["transl"] = transl_out
+        print("Warning: Using incam values for smpl_params_global (no ground plane estimated)")
+    
+    gvhmr_pred["smpl_params_global"] = smpl_params_global
 
     out_pt_path = os.path.join(args.gvhmr_dir, "baseline_foot_correction.pt")
     torch.save(gvhmr_pred, out_pt_path)
