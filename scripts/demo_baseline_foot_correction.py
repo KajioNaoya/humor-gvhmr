@@ -13,7 +13,7 @@ from humor.body_model.body_model import BodyModel
 from humor.body_model.utils import SMPL_JOINTS, smpl_to_openpose
 from humor.utils.transforms import batch_rodrigues, rotation_matrix_to_angle_axis
 
-from scripts.read_gvhmr_results import load_gvhmr_results
+from scripts.read_gvhmr_results import load_gvhmr_results, compute_gvhmr_rotation_matrix
 from scripts.demo_mmpose_external_smpl import (
     run_mmpose_halpe_on_video,
     halpe_seq_to_body25_seq,
@@ -156,6 +156,8 @@ def compute_losses(
     lambda_slide: float,
     lambda_plane: float,
     trans_init: torch.Tensor,  # (T, 3)
+    R_gvhmr_incam2global: Optional[torch.Tensor] = None,  # (3, 3) optional GVHMR rotation matrix
+    lambda_gvhmr_plane_prior: float = 0.0,  # weight for GVHMR plane prior
 ) -> Tuple[torch.Tensor, dict]:
     """
     Compute objective:
@@ -218,13 +220,16 @@ def compute_losses(
     kp2d_conf = body25_seq[..., 2:3]  # (T, 25, 1)
 
     reproj_err = proj_2d - kp2d_obs
-    reproj_loss = (reproj_err**2 * (kp2d_conf**2)).sum()
+    weight = kp2d_conf**2
+    weight_sum = weight.sum().clamp(min=1e-8)
+    # Weighted mean reprojection loss over all frames/keypoints
+    reproj_loss = (reproj_err**2 * weight).sum() / weight_sum
 
     # ------------------------------------------------------------------ #
     # Weak priors: translation and ankle corrections
     # ------------------------------------------------------------------ #
-    trans_prior_loss = (transl_var - trans_init).pow(2).sum()
-    ankle_prior_loss = ankle_delta.pow(2).sum()
+    trans_prior_loss = (transl_var - trans_init).pow(2).mean()
+    ankle_prior_loss = ankle_delta.pow(2).mean()
 
     # ------------------------------------------------------------------ #
     # Foot sliding: velocities ~ 0 during contact
@@ -250,7 +255,12 @@ def compute_losses(
         left_vel_loss = (left_vel.pow(2).sum(dim=-1) * left_mask).sum()
         right_vel_loss = (right_vel.pow(2).sum(dim=-1) * right_mask).sum()
 
-        slide_loss = left_vel_loss + right_vel_loss
+        contact_count = (
+            left_mask.sum() * left_ids.numel() + right_mask.sum() * right_ids.numel()
+        ).clamp(min=1e-8)
+
+        # Mean velocity penalty over contact frames/joints
+        slide_loss = (left_vel_loss + right_vel_loss) / contact_count
     else:
         slide_loss = torch.zeros((), device=device)
 
@@ -294,9 +304,28 @@ def compute_losses(
         all_pts = torch.cat(all_pts, dim=0)  # (M, 3)
 
         dist = all_pts @ normal.to(device) + d.to(device)
-        plane_loss = (dist**2).mean() * all_pts.shape[0]
+        # Mean squared distance to the plane across contact points
+        plane_loss = (dist**2).mean()
     else:
         plane_loss = torch.zeros((), device=device)
+
+    # ------------------------------------------------------------------ #
+    # GVHMR plane prior: normal should align with GVHMR's (0, 1, 0) in incam
+    # ------------------------------------------------------------------ #
+    gvhmr_plane_prior_loss = torch.zeros((), device=device)
+    if normal is not None and R_gvhmr_incam2global is not None and lambda_gvhmr_plane_prior > 0:
+        # GVHMR's world Y-axis (0, 1, 0) rotated to incam coordinates
+        world_y_axis = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=normal.dtype)
+        R_gvhmr_tensor = R_gvhmr_incam2global.to(device=device, dtype=normal.dtype)
+        # R_gvhmr_incam2global rotates from incam to global, so its inverse rotates from global to incam
+        R_global2incam = R_gvhmr_tensor.T  # (3, 3)
+        world_y_incam = R_global2incam @ world_y_axis  # (3,)
+        world_y_incam = world_y_incam / (world_y_incam.norm() + 1e-8)
+        
+        # Compute dot product between normal and rotated world Y-axis
+        # We want normal to align with world_y_incam, so we minimize (1 - dot(normal, world_y_incam))
+        dot_product = torch.dot(normal, world_y_incam)
+        gvhmr_plane_prior_loss = 1.0 - dot_product
 
     # ------------------------------------------------------------------ #
     # Total loss
@@ -307,6 +336,7 @@ def compute_losses(
         + lambda_ankle_prior * ankle_prior_loss
         + lambda_slide * slide_loss
         + lambda_plane * plane_loss
+        + lambda_gvhmr_plane_prior * gvhmr_plane_prior_loss
     )
 
     stats = {
@@ -316,6 +346,7 @@ def compute_losses(
         "ankle_prior": ankle_prior_loss.item(),
         "slide": slide_loss.item(),
         "plane": plane_loss.item(),
+        "gvhmr_plane_prior": gvhmr_plane_prior_loss.item(),
     }
     return total_loss, stats
 
@@ -547,13 +578,33 @@ def main():
     ).to(device)
 
     # ------------------------------------------------------------------ #
+    # 6.5) Compute GVHMR rotation matrix for plane prior
+    # ------------------------------------------------------------------ #
+    try:
+        R_gvhmr_incam2global_np = compute_gvhmr_rotation_matrix(
+            gvhmr_dir=args.gvhmr_dir,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame,
+            num_samples=20,
+        )
+        R_gvhmr_incam2global = torch.tensor(
+            R_gvhmr_incam2global_np, dtype=torch.float32, device=device
+        )  # (3, 3)
+        print(f"Computed GVHMR rotation matrix from incam to global")
+    except Exception as e:
+        print(f"Warning: Could not compute GVHMR rotation matrix: {e}")
+        print("GVHMR plane prior will be disabled.")
+        R_gvhmr_incam2global = None
+
+    # ------------------------------------------------------------------ #
     # 7) Loss weights
     # ------------------------------------------------------------------ #
-    lambda_2d = 0.001
-    lambda_trans_prior = 1e-2
-    lambda_ankle_prior = 1e-3
+    lambda_2d = 0.025
+    lambda_trans_prior = 10.0
+    lambda_ankle_prior = 1.0
     lambda_slide = 1.0
-    lambda_plane = 100.0
+    lambda_plane = 1000.0
+    lambda_gvhmr_plane_prior = 0.1 # 100.0 if R_gvhmr_incam2global is not None else 0.0
 
     # ------------------------------------------------------------------ #
     # 8) Optimization (LBFGS)
@@ -596,6 +647,8 @@ def main():
                 lambda_slide=lambda_slide,
                 lambda_plane=lambda_plane,
                 trans_init=trans_init,
+                R_gvhmr_incam2global=R_gvhmr_incam2global,
+                lambda_gvhmr_plane_prior=lambda_gvhmr_plane_prior,
             )
             loss.backward()
             print(
@@ -605,7 +658,8 @@ def main():
                 f"trans_prior={stats['trans_prior']:.4e}, "
                 f"ankle_prior={stats['ankle_prior']:.4e}, "
                 f"slide={stats['slide']:.4e}, "
-                f"plane={stats['plane']:.4e}"
+                f"plane={stats['plane']:.4e}, "
+                f"gvhmr_plane_prior={stats['gvhmr_plane_prior']:.4e}"
             )
             return loss
 
