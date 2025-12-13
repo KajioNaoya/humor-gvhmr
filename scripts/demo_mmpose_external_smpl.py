@@ -828,7 +828,17 @@ def main():
     smpl_params_global = gvhmr_pred.get("smpl_params_global", {})
     smpl_params_global["betas"] = betas_10
     smpl_params_global["body_pose"] = body_pose_flat
-    smpl_params_global["transl"] = prior_trans[0].detach().cpu().view(T_opt, 3)
+    
+    # Get translation and center X and Z coordinates (set mean to 0)
+    prior_trans_global = prior_trans[0].detach().cpu().view(T_opt, 3)  # (T, 3)
+    prior_trans_mean = prior_trans_global.mean(dim=0)  # (3,)
+    prior_trans_offset = torch.zeros_like(prior_trans_mean)
+    prior_trans_offset[0] = -prior_trans_mean[0]  # X offset
+    prior_trans_offset[2] = -prior_trans_mean[2]  # Z offset
+    # Y offset is 0 (preserve height)
+    prior_trans_centered = prior_trans_global + prior_trans_offset.unsqueeze(0)  # (T, 3)
+    
+    smpl_params_global["transl"] = prior_trans_centered
     smpl_params_global["global_orient"] = prior_root_orient[0].detach().cpu().view(T_opt, 3)
     gvhmr_pred["smpl_params_global"] = smpl_params_global
 
