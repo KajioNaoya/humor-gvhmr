@@ -267,32 +267,33 @@ def compute_losses(
     # ------------------------------------------------------------------ #
     # Ground-plane consistency for contact foot keypoints
     # ------------------------------------------------------------------ #
-    with torch.no_grad():
-        # Collect contact points (no grad for plane estimation)
-        pts_list = []
-        if left_contact.any():
-            pts_list.append(left_pos[left_contact].reshape(-1, 3))
-        if right_contact.any():
-            pts_list.append(right_pos[right_contact].reshape(-1, 3))
+    # Collect contact points (with grad enabled for plane estimation)
+    pts_list = []
+    if left_contact.any():
+        pts_list.append(left_pos[left_contact].reshape(-1, 3))
+    if right_contact.any():
+        pts_list.append(right_pos[right_contact].reshape(-1, 3))
 
-        if len(pts_list) > 0:
-            contact_pts = torch.cat(pts_list, dim=0)  # (M, 3)
-        else:
-            contact_pts = None
+    if len(pts_list) > 0:
+        contact_pts = torch.cat(pts_list, dim=0)  # (M, 3)
+    else:
+        contact_pts = None
 
-        if contact_pts is not None and contact_pts.shape[0] >= 3:
-            X = contact_pts.detach()
-            centroid = X.mean(dim=0, keepdim=True)  # (1, 3)
-            Xc = X - centroid
-            # SVD for best-fit plane normal
-            # Xc: (M, 3) -> U, S, Vh with Vh: (3,3)
-            _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
-            normal = Vh[-1]  # (3,)
-            normal = normal / (normal.norm() + 1e-8)
-            d = -torch.dot(normal, centroid.squeeze(0))
-        else:
-            normal = None
-            d = None
+    if contact_pts is not None and contact_pts.shape[0] >= 3:
+        X = contact_pts  # Keep gradient flow enabled
+        centroid = X.mean(dim=0, keepdim=True)  # (1, 3)
+        Xc = X - centroid
+        # SVD for best-fit plane normal
+        # Xc: (M, 3) -> U, S, Vh with Vh: (3,3)
+        # Note: SVD gradients are supported in PyTorch, but may be unstable
+        # if singular values are degenerate (close to each other)
+        _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
+        normal = Vh[-1]  # (3,)
+        normal = normal / (normal.norm() + 1e-8)
+        d = -torch.dot(normal, centroid.squeeze(0))
+    else:
+        normal = None
+        d = None
 
     if normal is not None:
         # Use current (grad-enabled) points in plane loss
@@ -316,15 +317,15 @@ def compute_losses(
     if normal is not None and R_gvhmr_incam2global is not None and lambda_gvhmr_plane_prior > 0:
         # GVHMR's world Y-axis (0, 1, 0) rotated to incam coordinates
         world_y_axis = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=normal.dtype)
-        R_gvhmr_tensor = R_gvhmr_incam2global.to(device=device, dtype=normal.dtype)
+        R_incam2global = R_gvhmr_incam2global.to(device=device, dtype=normal.dtype)
         # R_gvhmr_incam2global rotates from incam to global, so its inverse rotates from global to incam
-        R_global2incam = R_gvhmr_tensor.T  # (3, 3)
+        R_global2incam = R_incam2global.T  # (3, 3)
         world_y_incam = R_global2incam @ world_y_axis  # (3,)
         world_y_incam = world_y_incam / (world_y_incam.norm() + 1e-8)
         
         # Compute dot product between normal and rotated world Y-axis
         # We want normal to align with world_y_incam, so we minimize (1 - dot(normal, world_y_incam))
-        dot_product = torch.dot(normal, world_y_incam)
+        dot_product = torch.abs(torch.dot(normal, world_y_incam))
         gvhmr_plane_prior_loss = 1.0 - dot_product
 
     # ------------------------------------------------------------------ #
@@ -581,16 +582,21 @@ def main():
     # 6.5) Compute GVHMR rotation matrix for plane prior
     # ------------------------------------------------------------------ #
     try:
-        R_gvhmr_incam2global_np = compute_gvhmr_rotation_matrix(
+        T_gvhmr_incam2global_np = compute_gvhmr_rotation_matrix(
             gvhmr_dir=args.gvhmr_dir,
             start_frame=args.start_frame,
             end_frame=args.end_frame,
             num_samples=20,
         )
-        R_gvhmr_incam2global = torch.tensor(
-            R_gvhmr_incam2global_np, dtype=torch.float32, device=device
-        )  # (3, 3)
-        print(f"Computed GVHMR rotation matrix from incam to global")
+        T_gvhmr_incam2global = torch.tensor(
+            T_gvhmr_incam2global_np, dtype=torch.float32, device=device
+        )  # (4, 4)
+        # Extract rotation matrix (3x3) from homogeneous transformation matrix
+        R_gvhmr_incam2global = T_gvhmr_incam2global[:3, :3]  # (3, 3)
+        t_gvhmr_incam2global = T_gvhmr_incam2global[:3, 3]  # (3,) translation vector
+        print(f"Computed GVHMR transformation matrix from incam to global")
+        print(f"Rotation matrix:\n{R_gvhmr_incam2global}")
+        print(f"Translation vector: {t_gvhmr_incam2global}")
     except Exception as e:
         print(f"Warning: Could not compute GVHMR rotation matrix: {e}")
         print("GVHMR plane prior will be disabled.")
@@ -604,7 +610,7 @@ def main():
     lambda_ankle_prior = 1.0
     lambda_slide = 1.0
     lambda_plane = 1000.0
-    lambda_gvhmr_plane_prior = 0.1 # 100.0 if R_gvhmr_incam2global is not None else 0.0
+    lambda_gvhmr_plane_prior = 10.0 # 100.0 if R_gvhmr_incam2global is not None else 0.0
 
     # ------------------------------------------------------------------ #
     # 8) Optimization (LBFGS)
@@ -798,7 +804,8 @@ def main():
         # Convert global_orient from axis-angle to rotation matrix
         global_orient_mat = batch_rodrigues(global_orient_out.reshape(-1, 3))  # (T, 3, 3)
         
-        # Apply camera-to-world rotation: R_world = R_cam2world @ R_cam
+        # Apply camera-to-world rotation: R_world = R_cam2world @ R_cam @ R_cam2world.T
+        # This is the correct way to transform a rotation matrix between coordinate systems
         R_cam2world_expanded = R_cam2world.unsqueeze(0).expand(T_opt, 3, 3)  # (T, 3, 3)
         global_orient_world_mat = torch.matmul(R_cam2world_expanded, global_orient_mat)  # (T, 3, 3)
         
