@@ -820,19 +820,39 @@ def main():
             transl_out.unsqueeze(-1)
         ).squeeze(-1)  # (T, 3)
         
+        # Center X and Z coordinates (set mean to 0)
+        # Y coordinate (height) is preserved
+        transl_world_mean = transl_world.mean(dim=0)  # (3,)
+        transl_world_offset = torch.zeros_like(transl_world_mean)
+        transl_world_offset[0] = -transl_world_mean[0]  # X offset
+        transl_world_offset[2] = -transl_world_mean[2]  # Z offset
+        # Y offset is 0 (preserve height)
+        transl_world = transl_world + transl_world_offset.unsqueeze(0)  # (T, 3)
+        
         smpl_params_global["betas"] = betas_10_t
         smpl_params_global["body_pose"] = pose_body_out
         smpl_params_global["global_orient"] = global_orient_world
         smpl_params_global["transl"] = transl_world
         
         print("Computed smpl_params_global using ground plane-based coordinate transformation")
+        print(f"  Centered X and Z coordinates (offset: X={transl_world_offset[0]:.6f}, Z={transl_world_offset[2]:.6f})")
     else:
         # If no rotation matrix computed, use incam values (fallback)
+        # Center X and Z coordinates (set mean to 0)
+        # Y coordinate (height) is preserved
+        transl_out_mean = transl_out.mean(dim=0)  # (3,)
+        transl_out_offset = torch.zeros_like(transl_out_mean)
+        transl_out_offset[0] = -transl_out_mean[0]  # X offset
+        transl_out_offset[2] = -transl_out_mean[2]  # Z offset
+        # Y offset is 0 (preserve height)
+        transl_out_centered = transl_out + transl_out_offset.unsqueeze(0)  # (T, 3)
+        
         smpl_params_global["betas"] = betas_10_t
         smpl_params_global["body_pose"] = pose_body_out
         smpl_params_global["global_orient"] = global_orient_out
-        smpl_params_global["transl"] = transl_out
+        smpl_params_global["transl"] = transl_out_centered
         print("Warning: Using incam values for smpl_params_global (no ground plane estimated)")
+        print(f"  Centered X and Z coordinates (offset: X={transl_out_offset[0]:.6f}, Z={transl_out_offset[2]:.6f})")
     
     gvhmr_pred["smpl_params_global"] = smpl_params_global
 
