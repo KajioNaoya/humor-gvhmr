@@ -1,3 +1,104 @@
+## 使い方
+
+### 必要なファイルのダウンロードと配置
+
+`demo_baseline_foot_correction.py` を実行するために、以下のファイルをダウンロードし、指定のディレクトリに配置してください。
+
+#### 1. Body Model (SMPLH または SMPLX)
+
+**SMPLH (デフォルト)**:
+
+- **ダウンロード先**: https://mano.is.tue.mpg.de/
+- **手順**:
+  1. アカウントを作成してログイン
+  2. "Downloads" ページに移動
+  3. "Extended SMPL+H model (used in AMASS)" をダウンロード（`smplh.tar.xz`）
+  4. 解凍して以下のディレクトリ構造を作成：
+     ```
+     body_models/
+       └── smplh/
+           └── neutral/
+               └── model.npz
+     ```
+
+**SMPLX (オプション、`--model-type smplx` を使用する場合)**:
+
+- **ダウンロード先**: https://smpl-x.is.tue.mpg.de/
+- **手順**:
+  1. アカウントを作成してログイン
+  2. "Download" ページから SMPLX モデルをダウンロード
+  3. 以下のパスに配置：
+     ```
+     body_models/
+       └── smplx/
+           └── SMPLX_NEUTRAL.npz
+     ```
+
+#### 2. MMPose と MMDetection のチェックポイントと設定ファイル
+
+以下のファイルを `checkpoints/` ディレクトリに配置してください：
+
+**MMDetection (人物検出)**:
+
+1. リポジトリをクローンまたは必要なファイルをダウンロード：
+   ```bash
+   git clone https://github.com/open-mmlab/mmdetection.git
+   ```
+2. 設定ファイルをコピー：
+   ```bash
+   mkdir -p checkpoints/mmdet
+   cp mmdetection/configs/rtmdet/rtmdet_tiny_8xb32-300e_coco.py checkpoints/mmdet/
+   ```
+3. チェックポイントをダウンロード：
+   - ブラウザで https://github.com/open-mmlab/mmdetection/tree/main/configs/rtmdet を開く
+   - Model Zoo のリンクから `rtmdet_tiny_8xb32-300e_coco_20220902_112414-78e30dcc.pth` をダウンロード
+   - `checkpoints/mmdet/` に配置
+
+**MMPose (姿勢推定)**:
+
+1. リポジトリをクローンまたは必要なファイルをダウンロード：
+   ```bash
+   git clone https://github.com/open-mmlab/mmpose.git
+   ```
+2. 設定ファイルをコピー：
+   ```bash
+   mkdir -p checkpoints/mmpose
+   cp mmpose/configs/body_2d_keypoint/rtmpose/wholebody_2d/rtmpose-m_8xb512-700e_body8-halpe26-256x192.py checkpoints/mmpose/
+   ```
+3. チェックポイントをダウンロード：
+   - ブラウザで https://github.com/open-mmlab/mmpose/tree/main/configs/body_2d_keypoint/rtmpose/wholebody_2d を開く
+   - Model Zoo のリンクから `rtmpose-m_simcc-body7_pt-body7-halpe26_700e-256x192-4d3e73dd_20230605.pth` をダウンロード
+   - `checkpoints/mmpose/` に配置
+
+**注意**: 設定ファイルには依存関係（`_base_` で参照されるファイル）がある場合があります。エラーが発生した場合は、リポジトリ全体をクローンして、相対パスが正しく解決されるようにしてください。
+
+#### 3. GVHMR の出力結果
+
+GVHMR の出力結果を `data/` ディレクトリ等に配置してください。各データディレクトリには以下のファイルが必要です：
+
+- `hmr4d_results.pt`: GVHMR の SMPL パラメータ結果
+- `preprocess/vitpose.pt`: GVHMR の前処理結果
+
+### 実行
+
+必要なファイルを配置したら、以下のコマンドで実行できます：
+
+```
+python scripts/demo_baseline_foot_correction.py --gvhmr-dir ./data/1207_01 --video-path ./data/1207_01/0_input_video.mp4 --start-frame 0 --end-frame 619 --contact-csv ./data/1207_01/contact_labels.csv
+```
+
+**必須引数**:
+
+- `--gvhmr-dir`: GVHMR の出力結果ディレクトリ
+- `--video-path`: 入力動画のパス
+- `--contact-csv`: 足の接触ラベル CSV ファイル（T x 2 の形式、列: left_contact, right_contact）
+
+**オプション引数**:
+
+- `--model-type`: 使用するボディモデル (`smplh` または `smplx`、デフォルト: `smplx`)
+- `--focal-lengths`: カメラの焦点距離（ピクセル単位、未指定の場合は GVHMR の値を使用）
+- `--device`: 使用デバイス (`cuda:0` または `cpu`、デフォルト: CUDA が利用可能な場合は `cuda:0`)
+
 # HuMoR: 3D Human Motion Model for Robust Pose Estimation (ICCV 2021)
 
 This is the official implementation for the ICCV 2021 paper. For more information, see the [project webpage](https://geometry.stanford.edu/projects/humor/).
