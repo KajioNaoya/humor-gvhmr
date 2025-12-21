@@ -4,9 +4,9 @@
 
 `demo_baseline_foot_correction.py` を実行するために、以下のファイルをダウンロードし、指定のディレクトリに配置してください。
 
-#### 1. Body Model (SMPLH または SMPLX)
+#### 1. Body Model (SMPLH および SMPLX)
 
-**SMPLH (デフォルト)**:
+**SMPLH**:
 
 - **ダウンロード先**: https://mano.is.tue.mpg.de/
 - **手順**:
@@ -21,7 +21,7 @@
                └── model.npz
      ```
 
-**SMPLX (オプション、`--model-type smplx` を使用する場合)**:
+**SMPLX**:
 
 - **ダウンロード先**: https://smpl-x.is.tue.mpg.de/
 - **手順**:
