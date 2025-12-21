@@ -84,19 +84,20 @@ GVHMR の出力結果を `data/` ディレクトリ等に配置してくださ�
 必要なファイルを配置したら、以下のコマンドで実行できます：
 
 ```
-python scripts/demo_baseline_foot_correction.py --gvhmr-dir ./data/1207_01 --video-path ./data/1207_01/0_input_video.mp4 --start-frame 0 --end-frame 619 --contact-csv ./data/1207_01/contact_labels.csv
+python scripts/demo_baseline_foot_correction.py --gvhmr-dir ./data/1207_01 --video-path ./data/1207_01/0_input_video.mp4 --start-frame 0 --end-frame 619 --contact-side right
 ```
 
 **必須引数**:
 
 - `--gvhmr-dir`: GVHMR の出力結果ディレクトリ
 - `--video-path`: 入力動画のパス
-- `--contact-csv`: 足の接触ラベル CSV ファイル（T x 2 の形式、列: left_contact, right_contact）
 
 **オプション引数**:
 
-- `--model-type`: 使用するボディモデル (`smplh` または `smplx`、デフォルト: `smplx`)
+- `--contact-csv`: 足の接触ラベル CSV ファイル（T x 2 の形式、列: left_contact, right_contact）
+- `--contact-side`: ["right", "left", "both"]のいずれか．contact-csv を指定しない場合に指定する必要がある．映像の中でどちらの足を軸足にジャンプスクワットをしているかを指定する．(both は使わない想定)
 - `--focal-lengths`: カメラの焦点距離（ピクセル単位、未指定の場合は GVHMR の値を使用）
+- `--model-type`: 使用するボディモデル (`smplh` または `smplx`、デフォルト: `smplx`)
 - `--device`: 使用デバイス (`cuda:0` または `cpu`、デフォルト: CUDA が利用可能な場合は `cuda:0`)
 
 # HuMoR: 3D Human Motion Model for Robust Pose Estimation (ICCV 2021)

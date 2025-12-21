@@ -18,6 +18,7 @@ from scripts.demo_mmpose_external_smpl import (
     run_mmpose_halpe_on_video,
     halpe_seq_to_body25_seq,
 )
+from scripts.temporal_foot_contact_detection import detect_foot_contact
 
 
 def build_camera_matrix(
@@ -402,10 +403,22 @@ def main():
     parser.add_argument(
         "--contact-csv",
         type=str,
-        required=True,
+        default=None,
         help=(
             "Path to a T x 2 CSV file with foot contact labels per frame "
-            "(columns: left_contact, right_contact; values 0 or 1)."
+            "(columns: left_contact, right_contact; values 0 or 1). "
+            "If not provided, contact will be auto-detected from MMPose results."
+        ),
+    )
+    parser.add_argument(
+        "--contact-side",
+        type=str,
+        default="both",
+        choices=["left", "right", "both"],
+        help=(
+            "Which foot(s) to detect contact for when --contact-csv is not provided. "
+            "Options: 'left' (left foot only), 'right' (right foot only), 'both' (both feet). "
+            "For the non-detected foot, contact will be set to False (always floating)."
         ),
     )
     parser.add_argument(
@@ -416,6 +429,12 @@ def main():
         help="Body model type to use for the baseline optimization.",
     )
     args = parser.parse_args()
+    
+    # Validate arguments
+    if args.contact_csv is None and args.contact_side not in ["left", "right", "both"]:
+        raise ValueError(
+            "When --contact-csv is not provided, --contact-side must be one of: 'left', 'right', 'both'"
+        )
 
     # Device
     device = torch.device(
@@ -513,22 +532,55 @@ def main():
         cam_mat_np = _cam_mat_gvhmr
 
     # ------------------------------------------------------------------ #
-    # 4) Load foot contact CSV
+    # 4) Load or detect foot contact
     # ------------------------------------------------------------------ #
-    contact_labels = np.loadtxt(args.contact_csv, delimiter=",")
-    if contact_labels.ndim != 2 or contact_labels.shape[1] != 2:
-        raise ValueError(
-            f"Expected contact CSV with shape (T, 2), got {contact_labels.shape}. "
-            "Columns should be [left_contact, right_contact] with values 0 or 1."
-        )
-    if contact_labels.shape[0] != n_timestep:
-        raise ValueError(
-            "Mismatch between GVHMR frames and contact labels: "
-            f"GVHMR={n_timestep}, contact_csv={contact_labels.shape[0]}."
-        )
-
-    left_contact_np = contact_labels[:, 0].astype(bool)
-    right_contact_np = contact_labels[:, 1].astype(bool)
+    if args.contact_csv is not None:
+        # Load from CSV file
+        print("Loading foot contact from CSV file...")
+        contact_labels = np.loadtxt(args.contact_csv, delimiter=",")
+        if contact_labels.ndim != 2 or contact_labels.shape[1] != 2:
+            raise ValueError(
+                f"Expected contact CSV with shape (T, 2), got {contact_labels.shape}. "
+                "Columns should be [left_contact, right_contact] with values 0 or 1."
+            )
+        if contact_labels.shape[0] != n_timestep:
+            raise ValueError(
+                "Mismatch between GVHMR frames and contact labels: "
+                f"GVHMR={n_timestep}, contact_csv={contact_labels.shape[0]}."
+            )
+        left_contact_np = contact_labels[:, 0].astype(bool)
+        right_contact_np = contact_labels[:, 1].astype(bool)
+    else:
+        # Auto-detect contact from MMPose results
+        print(f"Auto-detecting foot contact from MMPose results (contact_side={args.contact_side})...")
+        
+        # Ensure halpe_seq is available (should be loaded from cache or computed above)
+        if 'halpe_seq' not in locals():
+            raise RuntimeError("halpe_seq not available. This should not happen.")
+        
+        # Detect contact using temporal_foot_contact_detection
+        contact_labels_auto = detect_foot_contact(
+            mmpose_keypoints=halpe_seq,
+            n_MA=10,
+            threshold_percentile=0.25,
+            n_consecutive=10
+        )  # (T, 2)
+        
+        # Apply contact_side setting
+        if args.contact_side == "left":
+            # Left foot: use auto-detection, Right foot: always False
+            left_contact_np = contact_labels_auto[:, 0].astype(bool)
+            right_contact_np = np.zeros(n_timestep, dtype=bool)
+        elif args.contact_side == "right":
+            # Right foot: use auto-detection, Left foot: always False
+            left_contact_np = np.zeros(n_timestep, dtype=bool)
+            right_contact_np = contact_labels_auto[:, 1].astype(bool)
+        else:  # "both"
+            # Both feet: use auto-detection for both
+            left_contact_np = contact_labels_auto[:, 0].astype(bool)
+            right_contact_np = contact_labels_auto[:, 1].astype(bool)
+        
+        print(f"Auto-detected contact: Left={left_contact_np.sum()}/{n_timestep}, Right={right_contact_np.sum()}/{n_timestep}")
 
     # ------------------------------------------------------------------ #
     # 5) Prepare tensors for optimization
