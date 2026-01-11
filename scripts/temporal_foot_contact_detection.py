@@ -1,5 +1,6 @@
 import numpy as np
 from scipy import interpolate
+from scipy.signal import butter, filtfilt
 
 from scripts.demo_mmpose_external_smpl import halpe_seq_to_body25_seq
 
@@ -149,11 +150,54 @@ def filter_short_contacts(contact: np.ndarray, n_consecutive: int) -> np.ndarray
     return filtered
 
 
+def lowpass_filter_keypoints(
+    keypoints_xy: np.ndarray, fs: float, cutoff_hz: float = 6.0, order: int = 4
+) -> np.ndarray:
+    """
+    Apply zero-phase Butterworth low-pass filtering to 2D keypoints (x,y) over time.
+
+    Args:
+        keypoints_xy: (T, 2) array of [x, y] over time
+        fs: sampling rate (Hz), typically video FPS
+        cutoff_hz: cutoff frequency (Hz). Default 6Hz.
+        order: Butterworth filter order. Default 4.
+
+    Returns:
+        filtered: (T, 2) filtered keypoints
+    """
+    if keypoints_xy.ndim != 2 or keypoints_xy.shape[1] != 2:
+        raise ValueError(f"Expected keypoints_xy with shape (T, 2), got {keypoints_xy.shape}")
+    if fs <= 0:
+        raise ValueError(f"fs must be positive, got {fs}")
+
+    T = keypoints_xy.shape[0]
+    if T == 0:
+        return keypoints_xy.astype(np.float64)
+
+    nyquist = 0.5 * float(fs)
+    wn = float(cutoff_hz) / nyquist
+    # Wn must be in (0, 1)
+    wn = max(min(wn, 0.999), 1e-6)
+
+    b, a = butter(order, wn, btype="low", analog=False)
+
+    # filtfilt needs a minimum length for padding
+    min_len = 3 * (max(len(a), len(b)) - 1)
+    if T <= min_len:
+        return keypoints_xy.astype(np.float64)
+
+    return filtfilt(b, a, keypoints_xy.astype(np.float64), axis=0)
+
+
 def detect_foot_contact(
     mmpose_keypoints: np.ndarray,
     n_MA: int = 10,
     threshold_percentile: float = 0.25,
-    n_consecutive: int = 10
+    n_consecutive: int = 10,
+    fps: float = 30.0,
+    apply_lowpass: bool = True,
+    lowpass_cutoff_hz: float = 6.0,
+    lowpass_order: int = 4,
 ) -> np.ndarray:
     """
     Detect foot contact from MMPose keypoints using heel VY (vertical velocity).
@@ -163,6 +207,11 @@ def detect_foot_contact(
         n_MA: int (default=10) - Moving average window size
         threshold_percentile: float (default=0.2) - Percentile for VY threshold (0.0-1.0)
         n_consecutive: int (default=10) - Minimum consecutive frames for valid contact
+        fps: sampling rate (Hz) for optional low-pass filtering (typically video FPS)
+        apply_lowpass: whether to low-pass filter 2D heel coordinates before velocity
+        lowpass_cutoff_hz: cutoff frequency for low-pass filter (Hz). Default 6Hz.
+        lowpass_order: Butterworth filter order. Default 4.
+        debug: if True, prints debug statistics
     
     Returns:
         contact_labels: (T, 2) numpy array - [left_contact, right_contact] as 0/1
@@ -178,48 +227,46 @@ def detect_foot_contact(
     # 1. Convert Halpe to BODY_25 format
     body25_seq = halpe_seq_to_body25_seq(mmpose_keypoints)  # (T, 25, 3)
     
-    # 2. Extract heel Y positions
-    left_heel_y = body25_seq[:, LHEEL_BODY25_IDX, 1]  # (T,)
-    right_heel_y = body25_seq[:, RHEEL_BODY25_IDX, 1]  # (T,)
-    
-    # Reshape to (T, 1) for filter_and_interpolate_keypoints compatibility
-    # (function expects (T, 2) but we only need Y coordinate)
-    left_heel_pos = np.stack([np.zeros(T), left_heel_y], axis=1)  # (T, 2) [dummy_x, y]
-    right_heel_pos = np.stack([np.zeros(T), right_heel_y], axis=1)  # (T, 2) [dummy_x, y]
+    # 2. Extract heel positions
+    left_heel_pos = body25_seq[:, LHEEL_BODY25_IDX, :2]  # (T, 2)
+    right_heel_pos = body25_seq[:, RHEEL_BODY25_IDX, :2]  # (T, 2)
     
     # 3. Filter and interpolate missing detections (5px threshold)
     left_heel_interp = filter_and_interpolate_keypoints(left_heel_pos, threshold=5.0)
     right_heel_interp = filter_and_interpolate_keypoints(right_heel_pos, threshold=5.0)
+
+    # 3.5 Optional low-pass filter on 2D coordinates to reduce noise
+    if apply_lowpass:
+        left_heel_interp = lowpass_filter_keypoints(
+            left_heel_interp, fs=float(fps), cutoff_hz=float(lowpass_cutoff_hz), order=int(lowpass_order)
+        )
+        right_heel_interp = lowpass_filter_keypoints(
+            right_heel_interp, fs=float(fps), cutoff_hz=float(lowpass_cutoff_hz), order=int(lowpass_order)
+        )
     
-    # Extract Y coordinates after interpolation
+    # Extract coordinates after interpolation
+    left_heel_x_interp = left_heel_interp[:, 0]  # (T,)
     left_heel_y_interp = left_heel_interp[:, 1]  # (T,)
+    right_heel_x_interp = right_heel_interp[:, 0]  # (T,)
     right_heel_y_interp = right_heel_interp[:, 1]  # (T,)
     
-    # 4. Compute VY (vertical velocity) as difference
-    left_vy = np.zeros(T, dtype=np.float64)
-    right_vy = np.zeros(T, dtype=np.float64)
+    # 4. Compute V2 (squared velocity) as difference
+    left_v2 = np.zeros(T, dtype=np.float64)
+    right_v2 = np.zeros(T, dtype=np.float64)
     
     if T > 1:
-        left_vy[1:] = left_heel_y_interp[1:] - left_heel_y_interp[:-1]
-        right_vy[1:] = right_heel_y_interp[1:] - right_heel_y_interp[:-1]
-    
-    # 5. Apply moving average to reduce noise
-    left_vy_ma = compute_moving_average(left_vy, window_size=n_MA)
-    right_vy_ma = compute_moving_average(right_vy, window_size=n_MA)
+        left_v2[1:] = (left_heel_x_interp[1:] - left_heel_x_interp[:-1])**2 + (left_heel_y_interp[1:] - left_heel_y_interp[:-1])**2
+        right_v2[1:] = (right_heel_x_interp[1:] - right_heel_x_interp[:-1])**2 + (right_heel_y_interp[1:] - right_heel_y_interp[:-1])**2
     
     # 6. Threshold-based contact detection
-    # Compute absolute values
-    left_vy_abs = np.abs(left_vy_ma)
-    right_vy_abs = np.abs(right_vy_ma)
-    
     # Compute threshold as percentile
     # threshold_percentile=0.2 means we use the 80th percentile (top 20% of values)
-    left_threshold = np.percentile(left_vy_abs, (1.0 - threshold_percentile) * 100)
-    right_threshold = np.percentile(right_vy_abs, (1.0 - threshold_percentile) * 100)
-    
-    # Contact when absolute VY is below threshold
-    left_contact = left_vy_abs < left_threshold
-    right_contact = right_vy_abs < right_threshold
+    left_threshold = np.percentile(left_v2, (1.0 - threshold_percentile) * 100)
+    right_threshold = np.percentile(right_v2, (1.0 - threshold_percentile) * 100)
+
+    # Contact when squared velocity is below threshold
+    left_contact = left_v2 < left_threshold
+    right_contact = right_v2 < right_threshold
     
     # 7. Filter short contact periods
     left_contact_filtered = filter_short_contacts(left_contact, n_consecutive)

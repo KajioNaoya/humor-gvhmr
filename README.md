@@ -87,6 +87,30 @@ GVHMR の出力結果を `data/` ディレクトリ等に配置してくださ�
 python scripts/demo_baseline_foot_correction.py --gvhmr-dir ./data/1207_01 --video-path ./data/1207_01/0_input_video.mp4 --start-frame 0 --end-frame 619 --contact-side right
 ```
 
+### カメラ ↔IMU 時刻同期（2 ジャンプでオフセット推定）
+
+2 回ジャンプを含む区間を指定し、**カメラ時刻（フレーム 0 を t=0）に対する IMU のオフセット秒**（`left_imu_offset` / `right_imu_offset`）を推定します。
+
+```
+python scripts/synchronize.py --gvhmr-dir ./data/1207_01 --video-path ./data/1207_01/0_input_video.mp4 --calib-start-frame 0 --calib-end-frame 300 --imu-csv ./data/1207_01/raw_sensor_data.csv --out-dir ./data/1207_01
+```
+
+**必須引数**:
+
+- `--video-path`: 入力動画のパス（mmpose をこの動画に対して実行します）
+- `--calib-start-frame`: 同期用の 2 回ジャンプが含まれる範囲を指定: 開始フレーム
+- `--calib-end-frame`: 同期用の 2 回ジャンプが含まれる範囲を指定: 終了フレーム
+- `--imu-csv`: IMU CSV のパス（Orphe 形式）
+- `--out-dir`: 出力ディレクトリ（`offsets_cam.txt` がここに生成されます）
+- `--gvhmr-dir`: 現状は互換のために必須（通常は `video-path` と同じデータディレクトリを指定）
+
+**出力**:
+
+- `offsets_cam.txt`（最小形式）:
+  - `left_imu_offset: <sec>`
+  - `right_imu_offset: <sec>`
+  - `back_imu_offset: 0.000000`（未使用のため固定）
+
 **必須引数**:
 
 - `--gvhmr-dir`: GVHMR の出力結果ディレクトリ

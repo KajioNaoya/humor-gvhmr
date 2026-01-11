@@ -2,6 +2,7 @@ import os
 import argparse
 from typing import Tuple, Optional
 
+import cv2
 import numpy as np
 import torch
 
@@ -18,7 +19,169 @@ from scripts.demo_mmpose_external_smpl import (
     run_mmpose_halpe_on_video,
     halpe_seq_to_body25_seq,
 )
-from scripts.temporal_foot_contact_detection import detect_foot_contact
+from scripts.temporal_foot_contact_detection import (
+    detect_foot_contact,
+    filter_and_interpolate_keypoints,
+    lowpass_filter_keypoints,
+)
+from scripts.imu import compute_contacts_from_imu, estimate_imu_offsets_from_contacts, save_contact_band_png
+
+
+def compute_heel_speed_from_body25(
+    body25_seq_np: np.ndarray,
+    fps: float,
+    apply_lowpass: bool = True,
+    lowpass_cutoff_hz: float = 6.0,
+    lowpass_order: int = 4,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute per-frame heel speed (px/sec) from BODY_25 2D keypoints.
+
+    This uses the same pre-processing as contact detection:
+      - interpolate missing detections (threshold=5px)
+      - optional low-pass filter (default cutoff 6Hz)
+
+    Returns:
+        left_speed: (T,) float64, px/sec
+        right_speed: (T,) float64, px/sec
+    """
+    if body25_seq_np.ndim != 3 or body25_seq_np.shape[2] < 2:
+        raise ValueError(f"Expected body25_seq_np with shape (T, 25, >=2), got {body25_seq_np.shape}")
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, got {fps}")
+
+    T = body25_seq_np.shape[0]
+    # BODY_25 heel indices (OpenPose): LHeel=21, RHeel=24
+    left_heel_xy = body25_seq_np[:, 21, :2].astype(np.float64)   # (T, 2)
+    right_heel_xy = body25_seq_np[:, 24, :2].astype(np.float64)  # (T, 2)
+
+    left_xy = filter_and_interpolate_keypoints(left_heel_xy, threshold=5.0)
+    right_xy = filter_and_interpolate_keypoints(right_heel_xy, threshold=5.0)
+
+    if apply_lowpass:
+        left_xy = lowpass_filter_keypoints(
+            left_xy, fs=float(fps), cutoff_hz=float(lowpass_cutoff_hz), order=int(lowpass_order)
+        )
+        right_xy = lowpass_filter_keypoints(
+            right_xy, fs=float(fps), cutoff_hz=float(lowpass_cutoff_hz), order=int(lowpass_order)
+        )
+
+    left_speed = np.zeros((T,), dtype=np.float64)
+    right_speed = np.zeros((T,), dtype=np.float64)
+    if T > 1:
+        dleft = left_xy[1:] - left_xy[:-1]    # (T-1, 2)
+        dright = right_xy[1:] - right_xy[:-1]
+        left_speed[1:] = np.linalg.norm(dleft, axis=1) * float(fps)
+        right_speed[1:] = np.linalg.norm(dright, axis=1) * float(fps)
+
+    return left_speed, right_speed
+
+
+def write_contact_overlay_video(
+    video_path: str,
+    start_frame: int,
+    end_frame: int,
+    out_path: str,
+    left_contact: np.ndarray,
+    right_contact: np.ndarray,
+    left_speed: Optional[np.ndarray],
+    right_speed: Optional[np.ndarray],
+    fps: float,
+) -> None:
+    """
+    Write a debug video overlaying per-frame foot contact states.
+
+    Draw circles:
+      - bottom-left: left foot contact (red if contact else gray)
+      - bottom-right: right foot contact
+    """
+    left_contact = np.asarray(left_contact).astype(bool)
+    right_contact = np.asarray(right_contact).astype(bool)
+    if left_contact.shape != right_contact.shape:
+        raise ValueError(f"Contact shape mismatch: left={left_contact.shape}, right={right_contact.shape}")
+
+    T = int(left_contact.shape[0])
+    if T <= 0:
+        raise ValueError("Empty contact sequence for overlay video")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Failed to open video: {video_path}")
+
+    # Seek to start frame
+    cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_frame))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if w <= 0 or h <= 0:
+        # fallback: read one frame to infer
+        ok, frame0 = cap.read()
+        if not ok:
+            cap.release()
+            raise RuntimeError("Failed to read frame for size inference")
+        h, w = frame0.shape[:2]
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_frame))
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"Failed to open VideoWriter: {out_path}")
+
+    margin = max(10, int(min(w, h) * 0.03))
+    radius = max(6, int(min(w, h) * 0.035))
+    thickness = -1  # filled
+
+    red = (0, 0, 255)       # BGR
+    gray = (160, 160, 160)  # BGR
+    outline = (0, 0, 0)
+
+    left_center = (margin + radius, h - margin - radius)
+    right_center = (w - margin - radius, h - margin - radius)
+
+    if left_speed is not None:
+        left_speed = np.asarray(left_speed).astype(np.float64)
+        if left_speed.shape != (T,):
+            raise ValueError(f"left_speed must have shape (T,), got {left_speed.shape}, T={T}")
+    if right_speed is not None:
+        right_speed = np.asarray(right_speed).astype(np.float64)
+        if right_speed.shape != (T,):
+            raise ValueError(f"right_speed must have shape (T,), got {right_speed.shape}, T={T}")
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.5, float(min(w, h)) / 900.0)
+    text_thickness = 2
+
+    for i in range(T):
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        lc = red if bool(left_contact[i]) else gray
+        rc = red if bool(right_contact[i]) else gray
+
+        cv2.circle(frame, left_center, radius, lc, thickness, lineType=cv2.LINE_AA)
+        cv2.circle(frame, left_center, radius, outline, 2, lineType=cv2.LINE_AA)
+        cv2.circle(frame, right_center, radius, rc, thickness, lineType=cv2.LINE_AA)
+        cv2.circle(frame, right_center, radius, outline, 2, lineType=cv2.LINE_AA)
+
+        # Speed text above circles
+        if left_speed is not None:
+            txt = f"v={left_speed[i]:.1f}px/s"
+            pos = (left_center[0] - radius, left_center[1] - radius - margin // 2)
+            cv2.putText(frame, txt, pos, font, font_scale, outline, text_thickness + 2, cv2.LINE_AA)
+            cv2.putText(frame, txt, pos, font, font_scale, (255, 255, 255), text_thickness, cv2.LINE_AA)
+        if right_speed is not None:
+            txt = f"v={right_speed[i]:.1f}px/s"
+            pos = (right_center[0] - radius * 3, right_center[1] - radius - margin // 2)
+            cv2.putText(frame, txt, pos, font, font_scale, outline, text_thickness + 2, cv2.LINE_AA)
+            cv2.putText(frame, txt, pos, font, font_scale, (255, 255, 255), text_thickness, cv2.LINE_AA)
+
+        writer.write(frame)
+
+    writer.release()
+    cap.release()
 
 
 def build_camera_matrix(
@@ -357,7 +520,8 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Baseline: optimize only SMPL translation and ankle joints "
-            "using GVHMR SMPL params, MMPose BODY_25 keypoints, and foot-contact CSV."
+            "using GVHMR SMPL params, MMPose BODY_25 keypoints, and foot-contact labels "
+            "(CSV or IMU with auto-sync)."
         )
     )
     parser.add_argument(
@@ -371,6 +535,15 @@ def main():
         type=str,
         required=True,
         help="Path to RGB video corresponding to GVHMR results.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        required=True,
+        help=(
+            "Video FPS (frames per second). Required for IMU time-sync/contact conversion "
+            "and for interpreting per-frame contact labels over time."
+        ),
     )
     parser.add_argument(
         "--start-frame",
@@ -407,7 +580,63 @@ def main():
         help=(
             "Path to a T x 2 CSV file with foot contact labels per frame "
             "(columns: left_contact, right_contact; values 0 or 1). "
-            "If not provided, contact will be auto-detected from MMPose results."
+            "If not provided, contact will be auto-detected from MMPose results, "
+            "or (if --imu-csv is provided) derived from IMU with auto-sync."
+        ),
+    )
+    parser.add_argument(
+        "--imu-csv",
+        type=str,
+        default=None,
+        help=(
+            "Optional IMU CSV file (Orphe format) for stance/contact detection. "
+            "If provided and --contact-csv is not set, the script will estimate "
+            "camera↔IMU start-time offsets by maximizing agreement between camera-based "
+            "and IMU-based contact signals, then use IMU contacts for optimization."
+        ),
+    )
+    parser.add_argument(
+        "--sync-max-offset-sec",
+        type=float,
+        default=200.0,
+        help="Max absolute start-time offset (seconds) to search when auto-syncing IMU.",
+    )
+    parser.add_argument(
+        "--sync-coarse-step-sec",
+        type=float,
+        default=0.2,
+        help="Coarse grid step (seconds) for IMU auto-sync search.",
+    )
+    parser.add_argument(
+        "--sync-refine-window-sec",
+        type=float,
+        default=2.0,
+        help="Refinement window (+/- seconds) around the best coarse offset, searched at 1-frame resolution.",
+    )
+    parser.add_argument(
+        "--sync-score",
+        type=str,
+        default="mcc",
+        choices=["mcc", "balanced_acc", "accuracy"],
+        help="Scoring function used to pick the best IMU offset from contact agreement.",
+    )
+    parser.add_argument(
+        "--sync-debug-plot-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional output directory to save debug plots for IMU auto-sync. "
+            "If set, saves offset-vs-score curves (coarse search) as PNG."
+        ),
+    )
+    parser.add_argument(
+        "--contact-overlay-video-out",
+        type=str,
+        default=None,
+        help=(
+            "Optional output path for a debug video overlaying camera-based foot contact "
+            "states (colored circles at bottom-left/right). If not set but --sync-debug-plot-dir "
+            "is provided, the overlay video is saved into that directory."
         ),
     )
     parser.add_argument(
@@ -562,8 +791,11 @@ def main():
         contact_labels_auto = detect_foot_contact(
             mmpose_keypoints=halpe_seq,
             n_MA=10,
-            threshold_percentile=0.25,
-            n_consecutive=10
+            threshold_percentile=0.5,
+            n_consecutive=10,
+            fps=float(args.fps),
+            apply_lowpass=True,
+            lowpass_cutoff_hz=6.0,
         )  # (T, 2)
         
         # Apply contact_side setting
@@ -579,8 +811,140 @@ def main():
             # Both feet: use auto-detection for both
             left_contact_np = contact_labels_auto[:, 0].astype(bool)
             right_contact_np = contact_labels_auto[:, 1].astype(bool)
+
+        # Keep a copy for debug/visualization (camera-based contacts)
+        left_contact_cam_np = left_contact_np.copy()
+        right_contact_cam_np = right_contact_np.copy()
         
         print(f"Auto-detected contact: Left={left_contact_np.sum()}/{n_timestep}, Right={right_contact_np.sum()}/{n_timestep}")
+
+        # If IMU is provided, auto-sync and then prefer IMU-based contacts
+        if args.imu_csv is not None:
+            estimate_left = args.contact_side in ("left", "both")
+            estimate_right = args.contact_side in ("right", "both")
+            print(
+                "Estimating camera↔IMU start-time offsets from foot contacts "
+                f"(score={args.sync_score}, max_offset={args.sync_max_offset_sec}s)..."
+            )
+
+            left_plot_path = None
+            right_plot_path = None
+            if args.sync_debug_plot_dir is not None:
+                os.makedirs(args.sync_debug_plot_dir, exist_ok=True)
+                base = f"sync_{video_stem}_{args.start_frame}_{end_tag}_{args.sync_score}"
+                left_plot_path = os.path.join(args.sync_debug_plot_dir, base + "_left.png")
+                right_plot_path = os.path.join(args.sync_debug_plot_dir, base + "_right.png")
+
+            sync_result = estimate_imu_offsets_from_contacts(
+                cam_left_contact=left_contact_np,
+                cam_right_contact=right_contact_np,
+                T=n_timestep,
+                fps=float(args.fps),
+                imu_csv_path=args.imu_csv,
+                max_offset_sec=float(args.sync_max_offset_sec),
+                coarse_step_sec=float(args.sync_coarse_step_sec),
+                refine_window_sec=float(args.sync_refine_window_sec),
+                score=str(args.sync_score),
+                estimate_left=estimate_left,
+                estimate_right=estimate_right,
+                debug_plot_left_path=left_plot_path,
+                debug_plot_right_path=right_plot_path,
+            )
+
+            # Extra debug info: durations/lengths of the compared signals
+            cam_dur = float(n_timestep) / float(args.fps)
+            print(
+                f"Sync debug lengths: camera_window={n_timestep} frames ({cam_dur:.3f}s), "
+                f"imu_left_duration={sync_result.get('left_imu_duration_sec', 0.0):.3f}s, "
+                f"imu_right_duration={sync_result.get('right_imu_duration_sec', 0.0):.3f}s"
+            )
+
+            left_off = float(sync_result["left_offset_sec"])
+            right_off = float(sync_result["right_offset_sec"])
+            left_score = sync_result.get("left_best_score", None)
+            right_score = sync_result.get("right_best_score", None)
+            print(
+                "Estimated IMU offsets (sec / frames): "
+                f"left={left_off:.3f}s ({left_off*args.fps:.1f}f, score={left_score}), "
+                f"right={right_off:.3f}s ({right_off*args.fps:.1f}f, score={right_score})"
+            )
+
+            left_contact_np, right_contact_np = compute_contacts_from_imu(
+                T=n_timestep,
+                fps=float(args.fps),
+                csv_path=args.imu_csv,
+                left_imu_offset=left_off,
+                right_imu_offset=right_off,
+            )
+
+            # Apply contact_side setting again (user intent should win)
+            if args.contact_side == "left":
+                right_contact_np = np.zeros(n_timestep, dtype=bool)
+            elif args.contact_side == "right":
+                left_contact_np = np.zeros(n_timestep, dtype=bool)
+
+            print(
+                f"Using IMU-based contacts for optimization: "
+                f"Left={left_contact_np.sum()}/{n_timestep}, Right={right_contact_np.sum()}/{n_timestep}"
+            )
+
+            # Debug band plots (camera vs IMU, left/right) over the camera window
+            if args.sync_debug_plot_dir is not None:
+                frame_times = (np.arange(n_timestep, dtype=np.float64) / float(args.fps)).astype(np.float64)
+                base_band = f"sync_{video_stem}_{args.start_frame}_{end_tag}_{args.sync_score}"
+                save_contact_band_png(
+                    contact=left_contact_cam_np,
+                    times_sec=frame_times,
+                    out_path=os.path.join(args.sync_debug_plot_dir, base_band + "_band_cam_left.png"),
+                    title="camera_contact_left",
+                )
+                save_contact_band_png(
+                    contact=right_contact_cam_np,
+                    times_sec=frame_times,
+                    out_path=os.path.join(args.sync_debug_plot_dir, base_band + "_band_cam_right.png"),
+                    title="camera_contact_right",
+                )
+                save_contact_band_png(
+                    contact=left_contact_np,
+                    times_sec=frame_times,
+                    out_path=os.path.join(args.sync_debug_plot_dir, base_band + "_band_imu_left.png"),
+                    title="imu_contact_left (aligned_to_camera_window)",
+                )
+                save_contact_band_png(
+                    contact=right_contact_np,
+                    times_sec=frame_times,
+                    out_path=os.path.join(args.sync_debug_plot_dir, base_band + "_band_imu_right.png"),
+                    title="imu_contact_right (aligned_to_camera_window)",
+                )
+
+            # Debug overlay video (camera contacts), useful for visually checking instability
+            overlay_out = args.contact_overlay_video_out
+            if overlay_out is None and args.sync_debug_plot_dir is not None:
+                overlay_out = os.path.join(
+                    args.sync_debug_plot_dir,
+                    f"sync_{video_stem}_{args.start_frame}_{end_tag}_{args.sync_score}_contact_overlay.mp4",
+                )
+            if overlay_out is not None:
+                print(f"Saving contact overlay video to {overlay_out} ...")
+                # Heel speed (camera window) for debug text
+                left_speed_px_s, right_speed_px_s = compute_heel_speed_from_body25(
+                    body25_seq_np=body25_seq_np,
+                    fps=float(args.fps),
+                    apply_lowpass=True,
+                    lowpass_cutoff_hz=6.0,
+                )
+                write_contact_overlay_video(
+                    video_path=args.video_path,
+                    start_frame=int(args.start_frame),
+                    end_frame=int(args.end_frame),
+                    out_path=overlay_out,
+                    left_contact=left_contact_cam_np,
+                    right_contact=right_contact_cam_np,
+                    left_speed=left_speed_px_s,
+                    right_speed=right_speed_px_s,
+                    fps=float(args.fps),
+                )
+                print("Saved contact overlay video.")
 
     # ------------------------------------------------------------------ #
     # 5) Prepare tensors for optimization
