@@ -488,6 +488,112 @@ def _write_offsets_txt_minimal(out_path: str, *, left_offset: float, right_offse
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
+
+def estimate_offsets_by_two_jumps(
+    *,
+    video_path: str,
+    calib_start_frame: int,
+    calib_end_frame: int,
+    imu_csv: str,
+    pose_config: str = "./checkpoints/mmpose/rtmpose-m_8xb512-700e_body8-halpe26-256x192.py",
+    pose_checkpoint: str = "./checkpoints/mmpose/rtmpose-m_simcc-body7_pt-body7-halpe26_700e-256x192-4d3e73dd_20230605.pth",
+    device: str = "cpu",
+    det_config: Optional[str] = "./checkpoints/mmdet/rtmdet_tiny_8xb32-300e_coco.py",
+    det_checkpoint: Optional[str] = "./checkpoints/mmdet/rtmdet_tiny_8xb32-300e_coco_20220902_112414-78e30dcc.pth",
+    det_score_thr: float = 0.5,
+    cam_peak_distance_frames: int = 10,
+    cam_peak_prominence: Optional[float] = None,
+    heel_score_thr: float = 0.1,
+    tolerance_ratio: float = 0.10,
+    imu_peak_distance_samples: Optional[int] = None,
+    imu_peak_prominence: Optional[float] = None,
+    imu_baseline_sec: float = 1.0,
+    imu_lowpass_hz: float = 20.0,
+    imu_min_distance_sec: float = 0.20,
+    imu_k_prom: float = 6.0,
+    imu_k_height: float = 6.0,
+    imu_polarity: str = "positive",
+    imu_flight_time_min_sec: float = 0.3,
+    imu_flight_time_max_sec: float = 0.7,
+) -> Tuple[float, float]:
+    """
+    Estimate camera-based left/right IMU start-time offsets using two jumps.
+
+    Offset definition matches `scripts.imu.read_imu_orphe`:
+        imu_time_in_camera = imu_time_local + offset_sec
+    where camera frame 0 corresponds to t=0 sec.
+
+    Returns:
+        (left_offset_sec, right_offset_sec)
+    """
+    cam1, cam2, dt_cam, _fps = _camera_two_jump_peaks(
+        video_path=video_path,
+        calib_start_frame=calib_start_frame,
+        calib_end_frame=calib_end_frame,
+        pose_config=pose_config,
+        pose_checkpoint=pose_checkpoint,
+        device=device,
+        det_config=det_config,
+        det_checkpoint=det_checkpoint,
+        det_score_thr=det_score_thr,
+        cam_peak_distance_frames=cam_peak_distance_frames,
+        cam_peak_prominence=cam_peak_prominence,
+        heel_score_thr=heel_score_thr,
+    )
+
+    # IMU: read with offset=0 to get IMU-local normalized timeline per foot
+    left, right = read_imu_orphe(imu_csv, left_imu_offset=0.0, right_imu_offset=0.0)
+    left_p1, left_p2, left_p3, left_p4 = _imu_select_jump_quadruple(
+        foot_data=left,
+        dt_cam=dt_cam,
+        tolerance_ratio=tolerance_ratio,
+        imu_peak_distance_samples=imu_peak_distance_samples,
+        imu_peak_prominence=imu_peak_prominence,
+        label="left",
+        imu_baseline_sec=imu_baseline_sec,
+        imu_lowpass_hz=imu_lowpass_hz,
+        imu_min_distance_sec=imu_min_distance_sec,
+        imu_k_prom=imu_k_prom,
+        imu_k_height=imu_k_height,
+        imu_polarity=imu_polarity,
+        flight_time_min_sec=imu_flight_time_min_sec,
+        flight_time_max_sec=imu_flight_time_max_sec,
+    )
+    right_p1, right_p2, right_p3, right_p4 = _imu_select_jump_quadruple(
+        foot_data=right,
+        dt_cam=dt_cam,
+        tolerance_ratio=tolerance_ratio,
+        imu_peak_distance_samples=imu_peak_distance_samples,
+        imu_peak_prominence=imu_peak_prominence,
+        label="right",
+        imu_baseline_sec=imu_baseline_sec,
+        imu_lowpass_hz=imu_lowpass_hz,
+        imu_min_distance_sec=imu_min_distance_sec,
+        imu_k_prom=imu_k_prom,
+        imu_k_height=imu_k_height,
+        imu_polarity=imu_polarity,
+        flight_time_min_sec=imu_flight_time_min_sec,
+        flight_time_max_sec=imu_flight_time_max_sec,
+    )
+
+    cam_apex1 = float(cam1.t)
+    cam_apex2 = float(cam2.t)
+
+    left_mid12 = 0.5 * (float(left_p1.t) + float(left_p2.t))
+    left_mid34 = 0.5 * (float(left_p3.t) + float(left_p4.t))
+    left_offset = 0.5 * ((cam_apex1 - left_mid12) + (cam_apex2 - left_mid34))
+
+    right_mid12 = 0.5 * (float(right_p1.t) + float(right_p2.t))
+    right_mid34 = 0.5 * (float(right_p3.t) + float(right_p4.t))
+    right_offset = 0.5 * ((cam_apex1 - right_mid12) + (cam_apex2 - right_mid34))
+
+    print("=== Offsets (camera-based) ===")
+    print(f"[offset] camera_apex_t_sec: t1={cam_apex1:.6f}, t2={cam_apex2:.6f}")
+    print(f"[offset] left_offset_sec: {left_offset:.6f}")
+    print(f"[offset] right_offset_sec: {right_offset:.6f}")
+
+    return float(left_offset), float(right_offset)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gvhmr-dir", type=str, required=True)
@@ -545,10 +651,11 @@ def main():
 
     args = parser.parse_args()
 
-    cam1, cam2, dt_cam, _fps = _camera_two_jump_peaks(
+    left_offset, right_offset = estimate_offsets_by_two_jumps(
         video_path=args.video_path,
         calib_start_frame=args.calib_start_frame,
         calib_end_frame=args.calib_end_frame,
+        imu_csv=args.imu_csv,
         pose_config=args.pose_config,
         pose_checkpoint=args.pose_checkpoint,
         device=args.device,
@@ -558,73 +665,21 @@ def main():
         cam_peak_distance_frames=args.cam_peak_distance_frames,
         cam_peak_prominence=args.cam_peak_prominence,
         heel_score_thr=args.heel_score_thr,
-    )
-
-    # IMU: read with offset=0 to get IMU-local normalized timeline per foot
-    left, right = read_imu_orphe(args.imu_csv, left_imu_offset=0.0, right_imu_offset=0.0)
-
-    left_p1, left_p2, left_p3, left_p4 = _imu_select_jump_quadruple(
-        foot_data=left,
-        dt_cam=dt_cam,
         tolerance_ratio=args.tolerance_ratio,
         imu_peak_distance_samples=args.imu_peak_distance_samples,
         imu_peak_prominence=args.imu_peak_prominence,
-        label="left",
         imu_baseline_sec=args.imu_baseline_sec,
         imu_lowpass_hz=args.imu_lowpass_hz,
         imu_min_distance_sec=args.imu_min_distance_sec,
         imu_k_prom=args.imu_k_prom,
         imu_k_height=args.imu_k_height,
         imu_polarity=args.imu_polarity,
-        flight_time_min_sec=args.imu_flight_time_min_sec,
-        flight_time_max_sec=args.imu_flight_time_max_sec,
+        imu_flight_time_min_sec=args.imu_flight_time_min_sec,
+        imu_flight_time_max_sec=args.imu_flight_time_max_sec,
     )
-    right_p1, right_p2, right_p3, right_p4 = _imu_select_jump_quadruple(
-        foot_data=right,
-        dt_cam=dt_cam,
-        tolerance_ratio=args.tolerance_ratio,
-        imu_peak_distance_samples=args.imu_peak_distance_samples,
-        imu_peak_prominence=args.imu_peak_prominence,
-        label="right",
-        imu_baseline_sec=args.imu_baseline_sec,
-        imu_lowpass_hz=args.imu_lowpass_hz,
-        imu_min_distance_sec=args.imu_min_distance_sec,
-        imu_k_prom=args.imu_k_prom,
-        imu_k_height=args.imu_k_height,
-        imu_polarity=args.imu_polarity,
-        flight_time_min_sec=args.imu_flight_time_min_sec,
-        flight_time_max_sec=args.imu_flight_time_max_sec,
-    )
-
-    # Offsets:
-    #   - Camera detects apex time per jump: cam1.t, cam2.t (frame0-based time)
-    #   - IMU detects takeoff/landing times per jump:
-    #         jump1_apex_time ~= (t1+t2)/2
-    #         jump2_apex_time ~= (t3+t4)/2
-    cam_apex1 = float(cam1.t)
-    cam_apex2 = float(cam2.t)
-
-    left_mid12 = 0.5 * (float(left_p1.t) + float(left_p2.t))
-    left_mid34 = 0.5 * (float(left_p3.t) + float(left_p4.t))
-    left_offset_1 = float(cam_apex1 - left_mid12)
-    left_offset_2 = float(cam_apex2 - left_mid34)
-    left_offset = float(0.5 * (left_offset_1 + left_offset_2))
-
-    right_mid12 = 0.5 * (float(right_p1.t) + float(right_p2.t))
-    right_mid34 = 0.5 * (float(right_p3.t) + float(right_p4.t))
-    right_offset_1 = float(cam_apex1 - right_mid12)
-    right_offset_2 = float(cam_apex2 - right_mid34)
-    right_offset = float(0.5 * (right_offset_1 + right_offset_2))
-
-    print("=== Offsets (camera-based) ===")
-    print(f"[offset] camera_apex_t_sec: t1={cam_apex1:.6f}, t2={cam_apex2:.6f}")
-    print(f"[offset] left_imu_apex_mid: mid12={left_mid12:.6f}, mid34={left_mid34:.6f}")
-    print(f"[offset] left_offset_1={left_offset_1:.6f}, left_offset_2={left_offset_2:.6f} => left_offset_avg={left_offset:.6f}")
-    print(f"[offset] right_imu_apex_mid: mid12={right_mid12:.6f}, mid34={right_mid34:.6f}")
-    print(f"[offset] right_offset_1={right_offset_1:.6f}, right_offset_2={right_offset_2:.6f} => right_offset_avg={right_offset:.6f}")
 
     out_path = args.out_offsets_txt or os.path.join(args.out_dir, "offsets_cam.txt")
-    _write_offsets_txt_minimal(out_path, left_offset=left_offset, right_offset=right_offset)
+    _write_offsets_txt_minimal(out_path, left_offset=float(left_offset), right_offset=float(right_offset))
     print(f"[offset] wrote: {out_path}")
 
 

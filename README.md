@@ -87,6 +87,22 @@ GVHMR の出力結果を `data/` ディレクトリ等に配置してくださ�
 python scripts/demo_baseline_foot_correction.py --gvhmr-dir ./data/1207_01 --video-path ./data/1207_01/0_input_video.mp4 --start-frame 0 --end-frame 619 --contact-side right
 ```
 
+#### 接地判定（contact_csv / IMU / mmpose 暫定）の優先順位
+
+- `--contact-csv` が指定されている場合: **CSV の接地ラベル**を使用
+- `--contact-csv` が無く `--imu-csv` が指定されている場合: **2 ジャンプでカメラ ↔IMU 同期** → **IMU 由来の接地**を使用
+- `--contact-csv` も `--imu-csv` も無い場合: 従来通り **mmpose（踵座標）由来の暫定接地**を使用
+
+#### IMU を使って最適化（2 ジャンプで自動同期）
+
+`--imu-csv` を指定する場合は、同期用に **2 回ジャンプが含まれる区間**を `--sync-calib-start-frame/--sync-calib-end-frame` で指定してください。
+
+```
+python scripts/demo_baseline_foot_correction.py --gvhmr-dir ./data/1207_01 --video-path ./data/1207_01/0_input_video.mp4 --fps 30 --start-frame 0 --end-frame 619 --contact-side right --imu-csv ./data/1207_01/raw_sensor_data.csv --sync-calib-start-frame 0 --sync-calib-end-frame 300
+```
+
+実行すると、推定したオフセットが `gvhmr-dir/offsets_cam_auto.txt` に保存されます。
+
 ### カメラ ↔IMU 時刻同期（2 ジャンプでオフセット推定）
 
 2 回ジャンプを含む区間を指定し、**カメラ時刻（フレーム 0 を t=0）に対する IMU のオフセット秒**（`left_imu_offset` / `right_imu_offset`）を推定します。

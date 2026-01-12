@@ -6,6 +6,25 @@ import cv2
 import numpy as np
 import torch
 
+SYNC_DEFAULTS = {
+    # Camera (heel-y) peak detection
+    "cam_peak_distance_frames": 10,
+    "cam_peak_prominence": None,
+    "heel_score_thr": 0.1,
+    # IMU peak matching
+    "tolerance_ratio": 0.10,
+    "imu_peak_distance_samples": None,
+    "imu_peak_prominence": None,
+    "imu_baseline_sec": 1.0,
+    "imu_lowpass_hz": 20.0,
+    "imu_min_distance_sec": 0.20,
+    "imu_k_prom": 6.0,
+    "imu_k_height": 6.0,
+    "imu_polarity": "positive",
+    "imu_flight_time_min_sec": 0.3,
+    "imu_flight_time_max_sec": 0.7,
+}
+
 from humor.fitting.fitting_utils import (
     DEFAULT_FOCAL_LEN,
     perspective_projection,
@@ -24,7 +43,20 @@ from scripts.temporal_foot_contact_detection import (
     filter_and_interpolate_keypoints,
     lowpass_filter_keypoints,
 )
-from scripts.imu import compute_contacts_from_imu, estimate_imu_offsets_from_contacts, save_contact_band_png
+from scripts.imu import compute_contacts_from_imu
+from scripts.synchronize import estimate_offsets_by_two_jumps
+
+
+def _write_offsets_cam_auto_txt(out_path: str, *, left_offset: float, right_offset: float) -> None:
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    lines = [
+        f"left_imu_offset: {float(left_offset):.6f}",
+        f"right_imu_offset: {float(right_offset):.6f}",
+        "back_imu_offset: 0.000000",
+        "",
+    ]
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def compute_heel_speed_from_body25(
@@ -591,53 +623,27 @@ def main():
         help=(
             "Optional IMU CSV file (Orphe format) for stance/contact detection. "
             "If provided and --contact-csv is not set, the script will estimate "
-            "camera↔IMU start-time offsets by maximizing agreement between camera-based "
-            "and IMU-based contact signals, then use IMU contacts for optimization."
+            "camera↔IMU start-time offsets using two jumps (scripts/synchronize.py) "
+            "and then use IMU contacts for optimization."
         ),
     )
     parser.add_argument(
-        "--sync-max-offset-sec",
-        type=float,
-        default=200.0,
-        help="Max absolute start-time offset (seconds) to search when auto-syncing IMU.",
+        "--sync-calib-start-frame",
+        type=int,
+        default=None,
+        help="Start frame index (inclusive) of the 2-jump calibration segment used for camera↔IMU sync.",
     )
     parser.add_argument(
-        "--sync-coarse-step-sec",
-        type=float,
-        default=0.2,
-        help="Coarse grid step (seconds) for IMU auto-sync search.",
+        "--sync-calib-end-frame",
+        type=int,
+        default=None,
+        help="End frame index (inclusive) of the 2-jump calibration segment used for camera↔IMU sync.",
     )
     parser.add_argument(
-        "--sync-refine-window-sec",
-        type=float,
-        default=2.0,
-        help="Refinement window (+/- seconds) around the best coarse offset, searched at 1-frame resolution.",
-    )
-    parser.add_argument(
-        "--sync-score",
-        type=str,
-        default="mcc",
-        choices=["mcc", "balanced_acc", "accuracy"],
-        help="Scoring function used to pick the best IMU offset from contact agreement.",
-    )
-    parser.add_argument(
-        "--sync-debug-plot-dir",
+        "--sync-device",
         type=str,
         default=None,
-        help=(
-            "Optional output directory to save debug plots for IMU auto-sync. "
-            "If set, saves offset-vs-score curves (coarse search) as PNG."
-        ),
-    )
-    parser.add_argument(
-        "--contact-overlay-video-out",
-        type=str,
-        default=None,
-        help=(
-            "Optional output path for a debug video overlaying camera-based foot contact "
-            "states (colored circles at bottom-left/right). If not set but --sync-debug-plot-dir "
-            "is provided, the overlay video is saved into that directory."
-        ),
+        help="Device for MMPose during jump-based sync (e.g., 'cuda:0' or 'cpu'). Defaults to --device.",
     )
     parser.add_argument(
         "--contact-side",
@@ -664,6 +670,12 @@ def main():
         raise ValueError(
             "When --contact-csv is not provided, --contact-side must be one of: 'left', 'right', 'both'"
         )
+    if args.contact_csv is None and args.imu_csv is not None:
+        if args.sync_calib_start_frame is None or args.sync_calib_end_frame is None:
+            raise ValueError(
+                "When --imu-csv is provided (and --contact-csv is not set), "
+                "--sync-calib-start-frame and --sync-calib-end-frame are required."
+            )
 
     # Device
     device = torch.device(
@@ -820,61 +832,44 @@ def main():
 
         # If IMU is provided, auto-sync and then prefer IMU-based contacts
         if args.imu_csv is not None:
-            estimate_left = args.contact_side in ("left", "both")
-            estimate_right = args.contact_side in ("right", "both")
+            sync_device = args.sync_device if args.sync_device is not None else str(device)
+
             print(
-                "Estimating camera↔IMU start-time offsets from foot contacts "
-                f"(score={args.sync_score}, max_offset={args.sync_max_offset_sec}s)..."
+                "Estimating camera↔IMU start-time offsets using two jumps "
+                f"(calib={args.sync_calib_start_frame}..{args.sync_calib_end_frame}, device={sync_device})..."
             )
 
-            left_plot_path = None
-            right_plot_path = None
-            if args.sync_debug_plot_dir is not None:
-                os.makedirs(args.sync_debug_plot_dir, exist_ok=True)
-                base = f"sync_{video_stem}_{args.start_frame}_{end_tag}_{args.sync_score}"
-                left_plot_path = os.path.join(args.sync_debug_plot_dir, base + "_left.png")
-                right_plot_path = os.path.join(args.sync_debug_plot_dir, base + "_right.png")
-
-            sync_result = estimate_imu_offsets_from_contacts(
-                cam_left_contact=left_contact_np,
-                cam_right_contact=right_contact_np,
-                T=n_timestep,
-                fps=float(args.fps),
-                imu_csv_path=args.imu_csv,
-                max_offset_sec=float(args.sync_max_offset_sec),
-                coarse_step_sec=float(args.sync_coarse_step_sec),
-                refine_window_sec=float(args.sync_refine_window_sec),
-                score=str(args.sync_score),
-                estimate_left=estimate_left,
-                estimate_right=estimate_right,
-                debug_plot_left_path=left_plot_path,
-                debug_plot_right_path=right_plot_path,
+            left_off, right_off = estimate_offsets_by_two_jumps(
+                video_path=args.video_path,
+                calib_start_frame=int(args.sync_calib_start_frame),
+                calib_end_frame=int(args.sync_calib_end_frame),
+                imu_csv=args.imu_csv,
+                pose_config=POSE_CONFIG,
+                pose_checkpoint=POSE_CHECKPOINT,
+                device=str(sync_device),
+                det_config=DET_CONFIG,
+                det_checkpoint=DET_CHECKPOINT,
+                det_score_thr=0.5,
+                **SYNC_DEFAULTS,
             )
 
-            # Extra debug info: durations/lengths of the compared signals
-            cam_dur = float(n_timestep) / float(args.fps)
-            print(
-                f"Sync debug lengths: camera_window={n_timestep} frames ({cam_dur:.3f}s), "
-                f"imu_left_duration={sync_result.get('left_imu_duration_sec', 0.0):.3f}s, "
-                f"imu_right_duration={sync_result.get('right_imu_duration_sec', 0.0):.3f}s"
-            )
-
-            left_off = float(sync_result["left_offset_sec"])
-            right_off = float(sync_result["right_offset_sec"])
-            left_score = sync_result.get("left_best_score", None)
-            right_score = sync_result.get("right_best_score", None)
             print(
                 "Estimated IMU offsets (sec / frames): "
-                f"left={left_off:.3f}s ({left_off*args.fps:.1f}f, score={left_score}), "
-                f"right={right_off:.3f}s ({right_off*args.fps:.1f}f, score={right_score})"
+                f"left={left_off:.3f}s ({left_off*args.fps:.1f}f), "
+                f"right={right_off:.3f}s ({right_off*args.fps:.1f}f)"
             )
+
+            # Persist offsets next to GVHMR dir (does not touch offsets_cam.txt)
+            offsets_auto_path = os.path.join(args.gvhmr_dir, "offsets_cam_auto.txt")
+            _write_offsets_cam_auto_txt(offsets_auto_path, left_offset=left_off, right_offset=right_off)
+            print(f"Wrote offsets to {offsets_auto_path}")
 
             left_contact_np, right_contact_np = compute_contacts_from_imu(
                 T=n_timestep,
                 fps=float(args.fps),
                 csv_path=args.imu_csv,
-                left_imu_offset=left_off,
-                right_imu_offset=right_off,
+                left_imu_offset=float(left_off),
+                right_imu_offset=float(right_off),
             )
 
             # Apply contact_side setting again (user intent should win)
@@ -887,64 +882,6 @@ def main():
                 f"Using IMU-based contacts for optimization: "
                 f"Left={left_contact_np.sum()}/{n_timestep}, Right={right_contact_np.sum()}/{n_timestep}"
             )
-
-            # Debug band plots (camera vs IMU, left/right) over the camera window
-            if args.sync_debug_plot_dir is not None:
-                frame_times = (np.arange(n_timestep, dtype=np.float64) / float(args.fps)).astype(np.float64)
-                base_band = f"sync_{video_stem}_{args.start_frame}_{end_tag}_{args.sync_score}"
-                save_contact_band_png(
-                    contact=left_contact_cam_np,
-                    times_sec=frame_times,
-                    out_path=os.path.join(args.sync_debug_plot_dir, base_band + "_band_cam_left.png"),
-                    title="camera_contact_left",
-                )
-                save_contact_band_png(
-                    contact=right_contact_cam_np,
-                    times_sec=frame_times,
-                    out_path=os.path.join(args.sync_debug_plot_dir, base_band + "_band_cam_right.png"),
-                    title="camera_contact_right",
-                )
-                save_contact_band_png(
-                    contact=left_contact_np,
-                    times_sec=frame_times,
-                    out_path=os.path.join(args.sync_debug_plot_dir, base_band + "_band_imu_left.png"),
-                    title="imu_contact_left (aligned_to_camera_window)",
-                )
-                save_contact_band_png(
-                    contact=right_contact_np,
-                    times_sec=frame_times,
-                    out_path=os.path.join(args.sync_debug_plot_dir, base_band + "_band_imu_right.png"),
-                    title="imu_contact_right (aligned_to_camera_window)",
-                )
-
-            # Debug overlay video (camera contacts), useful for visually checking instability
-            overlay_out = args.contact_overlay_video_out
-            if overlay_out is None and args.sync_debug_plot_dir is not None:
-                overlay_out = os.path.join(
-                    args.sync_debug_plot_dir,
-                    f"sync_{video_stem}_{args.start_frame}_{end_tag}_{args.sync_score}_contact_overlay.mp4",
-                )
-            if overlay_out is not None:
-                print(f"Saving contact overlay video to {overlay_out} ...")
-                # Heel speed (camera window) for debug text
-                left_speed_px_s, right_speed_px_s = compute_heel_speed_from_body25(
-                    body25_seq_np=body25_seq_np,
-                    fps=float(args.fps),
-                    apply_lowpass=True,
-                    lowpass_cutoff_hz=6.0,
-                )
-                write_contact_overlay_video(
-                    video_path=args.video_path,
-                    start_frame=int(args.start_frame),
-                    end_frame=int(args.end_frame),
-                    out_path=overlay_out,
-                    left_contact=left_contact_cam_np,
-                    right_contact=right_contact_cam_np,
-                    left_speed=left_speed_px_s,
-                    right_speed=right_speed_px_s,
-                    fps=float(args.fps),
-                )
-                print("Saved contact overlay video.")
 
     # ------------------------------------------------------------------ #
     # 5) Prepare tensors for optimization
